@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="FluentZip.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:FluentZip"
+    xmlns:models="using:FluentZip.Models">
+
+    <Grid x:Name="RootGrid" RowSpacing="0" PointerPressed="OnRootPointerPressed"
+          Loaded="OnRootLoaded"
+          Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+          KeyboardAcceleratorPlacementMode="Hidden">
+
+        <Grid.Resources>
+            <!-- Row templates for the four view modes; the group-header template is
+                 chosen automatically for Header rows by FileItemTemplateSelector.
+                 The whole item is the drag handle (Tag="draghandle"): pressing and
+                 moving anywhere on it starts a drag instantly (StartDragAsync in code,
+                 after capturing the pointer). Items are content-width (containers are
+                 left-aligned, see StackItemStyle), so the empty space beside/below the
+                 items is free for marquee selection. -->
+            <DataTemplate x:Key="DetailsTemplate" x:DataType="models:FileItem">
+                <Grid ColumnSpacing="12" Padding="8,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="320" />
+                        <ColumnDefinition Width="{Binding SizeLen, Source={StaticResource Cols}}" />
+                        <ColumnDefinition Width="{Binding ModifiedLen, Source={StaticResource Cols}}" />
+                    </Grid.ColumnDefinitions>
+                    <!-- Only the icon+name is the drag handle, so the drag preview is a
+                         compact card (not the whole row) and size/date are plain text. -->
+                    <StackPanel Grid.Column="0" Tag="draghandle" CanDrag="True" DragStarting="OnItemDragStarting"
+                                Background="Transparent" Orientation="Horizontal" Spacing="12"
+                                HorizontalAlignment="Left" VerticalAlignment="Center">
+                        <FontIcon Glyph="{x:Bind Glyph}" FontSize="16" VerticalAlignment="Center"
+                                  Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                        <StackPanel VerticalAlignment="Center" HorizontalAlignment="Left">
+                            <TextBlock Text="{x:Bind Name}" TextTrimming="CharacterEllipsis" />
+                            <TextBlock Text="{x:Bind Subtitle}" Visibility="{x:Bind SubtitleVisibility}"
+                                       FontSize="11" TextTrimming="CharacterEllipsis"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </StackPanel>
+                    <TextBlock Grid.Column="1" Text="{x:Bind SizeText, Mode=OneWay}" VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <TextBlock Grid.Column="2" Text="{x:Bind ModifiedText}" VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </Grid>
+            </DataTemplate>
+
+            <DataTemplate x:Key="ListTemplate" x:DataType="models:FileItem">
+                <StackPanel Tag="draghandle" CanDrag="True" DragStarting="OnItemDragStarting"
+                            Background="Transparent"
+                            Orientation="Horizontal" Spacing="10" Padding="8,0" VerticalAlignment="Center">
+                    <FontIcon Glyph="{x:Bind Glyph}" FontSize="15" VerticalAlignment="Center"
+                              Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                    <TextBlock Text="{x:Bind Name}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+            </DataTemplate>
+
+            <DataTemplate x:Key="LargeIconsTemplate" x:DataType="models:FileItem">
+                <StackPanel Tag="draghandle" CanDrag="True" DragStarting="OnItemDragStarting"
+                            Background="Transparent"
+                            Width="{Binding TileWidth, Source={StaticResource ViewState}}"
+                            Padding="4,8" HorizontalAlignment="Center" VerticalAlignment="Top">
+                    <FontIcon Glyph="{x:Bind Glyph}"
+                              FontSize="{Binding IconSize, Source={StaticResource ViewState}}"
+                              HorizontalAlignment="Center"
+                              Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                    <TextBlock Text="{x:Bind Name}" TextAlignment="Center" TextWrapping="Wrap"
+                               MaxLines="2" TextTrimming="CharacterEllipsis" HorizontalAlignment="Center"
+                               Margin="0,6,0,0" Width="{Binding NameWidth, Source={StaticResource ViewState}}" />
+                </StackPanel>
+            </DataTemplate>
+
+            <DataTemplate x:Key="SmallIconsTemplate" x:DataType="models:FileItem">
+                <StackPanel Tag="draghandle" CanDrag="True" DragStarting="OnItemDragStarting"
+                            Background="Transparent"
+                            Orientation="Horizontal" Spacing="8" Padding="6,4" VerticalAlignment="Center">
+                    <FontIcon Glyph="{x:Bind Glyph}" FontSize="18" VerticalAlignment="Center"
+                              Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                    <TextBlock Text="{x:Bind Name}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+            </DataTemplate>
+
+            <DataTemplate x:Key="HeaderTemplate" x:DataType="models:FileItem">
+                <Border IsHitTestVisible="False" Padding="8,10,0,4">
+                    <TextBlock Text="{x:Bind Name}" FontWeight="SemiBold"
+                               Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                </Border>
+            </DataTemplate>
+
+            <local:FileItemTemplateSelector x:Key="ItemTemplates"
+                Details="{StaticResource DetailsTemplate}"
+                List="{StaticResource ListTemplate}"
+                LargeIcons="{StaticResource LargeIconsTemplate}"
+                SmallIcons="{StaticResource SmallIconsTemplate}"
+                Header="{StaticResource HeaderTemplate}" />
+
+            <ItemsPanelTemplate x:Key="StackPanelTemplate">
+                <ItemsStackPanel Orientation="Vertical" />
+            </ItemsPanelTemplate>
+            <ItemsPanelTemplate x:Key="WrapLargeTemplate">
+                <ItemsWrapGrid Orientation="Horizontal"
+                               ItemWidth="{Binding TileWidth, Source={StaticResource ViewState}}"
+                               ItemHeight="{Binding TileHeight, Source={StaticResource ViewState}}" />
+            </ItemsPanelTemplate>
+            <ItemsPanelTemplate x:Key="WrapSmallTemplate">
+                <ItemsWrapGrid Orientation="Horizontal" ItemWidth="240" ItemHeight="34" />
+            </ItemsPanelTemplate>
+
+            <!-- List/Details rows are left-aligned and only as wide as their content,
+                 so the empty space to the right of (and below) the rows is available to
+                 start a marquee selection instead of the row filling the whole window. -->
+            <Style x:Key="StackItemStyle" TargetType="ListViewItem">
+                <Setter Property="Padding" Value="8,2" />
+                <Setter Property="MinHeight" Value="34" />
+                <Setter Property="HorizontalAlignment" Value="Left" />
+                <Setter Property="HorizontalContentAlignment" Value="Left" />
+            </Style>
+            <Style x:Key="TileItemStyle" TargetType="ListViewItem">
+                <Setter Property="Padding" Value="2" />
+                <Setter Property="Margin" Value="1" />
+                <Setter Property="MinHeight" Value="0" />
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                <Setter Property="VerticalContentAlignment" Value="Stretch" />
+            </Style>
+        </Grid.Resources>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="40" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Title bar -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Padding="12,0,0,0" ColumnSpacing="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <FontIcon Grid.Column="0" Glyph="&#xF012;" FontSize="15"
+                      VerticalAlignment="Center" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+            <TextBlock Grid.Column="1" Text="FluentZip" VerticalAlignment="Center"
+                       Style="{ThemeResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+        </Grid>
+
+        <!-- Command bar -->
+        <Grid Grid.Row="1" Padding="10,4,10,6" ColumnSpacing="4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
+                <Button x:Name="BackButton" Click="OnBack" Padding="9,6"
+                        ToolTipService.ToolTip="Back (Alt+←, mouse side button)" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE72B;" FontSize="14" />
+                </Button>
+                <Button x:Name="ForwardButton" Click="OnForward" Padding="9,6"
+                        ToolTipService.ToolTip="Forward (Alt+→, mouse side button)" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE72A;" FontSize="14" />
+                </Button>
+            </StackPanel>
+
+            <AutoSuggestBox Grid.Column="1" x:Name="PathBox" Margin="6,0,6,0"
+                            VerticalAlignment="Center"
+                            TextChanged="OnPathTextChanged"
+                            QuerySubmitted="OnPathQuerySubmitted"
+                            SuggestionChosen="OnPathSuggestionChosen"
+                            LostFocus="OnPathLostFocus"
+                            PlaceholderText="Type a path and press Enter" />
+
+            <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                <Button x:Name="CompressButton" Click="OnCompress" Padding="10,6" IsEnabled="False"
+                        ToolTipService.ToolTip="Add to archive">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <FontIcon Glyph="&#xE710;" FontSize="14" />
+                        <TextBlock Text="Add" />
+                    </StackPanel>
+                </Button>
+                <Button x:Name="ExtractButton" Click="OnExtract" Padding="10,6" IsEnabled="False"
+                        Style="{ThemeResource AccentButtonStyle}" ToolTipService.ToolTip="Extract">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <FontIcon Glyph="&#xE8DE;" FontSize="14" />
+                        <TextBlock Text="Extract" />
+                    </StackPanel>
+                </Button>
+            </StackPanel>
+
+            <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="2" VerticalAlignment="Center" Margin="6,0,0,0">
+                <Button x:Name="SortButton" Padding="9,6"
+                        ToolTipService.ToolTip="Sort" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE8CB;" FontSize="14" />
+                    <Button.Flyout>
+                        <MenuFlyout Placement="Bottom">
+                            <RadioMenuFlyoutItem x:Name="SortNameItem" Text="Name" GroupName="sf" Tag="Name" Click="OnSortFieldClick" />
+                            <RadioMenuFlyoutItem x:Name="SortModifiedItem" Text="Date modified" GroupName="sf" Tag="Modified" Click="OnSortFieldClick" />
+                            <RadioMenuFlyoutItem x:Name="SortTypeItem" Text="Type" GroupName="sf" Tag="Type" Click="OnSortFieldClick" />
+                            <RadioMenuFlyoutItem x:Name="SortSizeItem" Text="Size" GroupName="sf" Tag="Size" Click="OnSortFieldClick" />
+                            <MenuFlyoutSeparator />
+                            <RadioMenuFlyoutItem x:Name="SortAscItem" Text="Ascending" GroupName="sd" Tag="Asc" Click="OnSortDirClick" />
+                            <RadioMenuFlyoutItem x:Name="SortDescItem" Text="Descending" GroupName="sd" Tag="Desc" Click="OnSortDirClick" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutSubItem Text="Group by">
+                                <RadioMenuFlyoutItem x:Name="GroupNoneItem" Text="None" GroupName="gb" Tag="None" Click="OnGroupClick" />
+                                <RadioMenuFlyoutItem x:Name="GroupTypeItem" Text="Type" GroupName="gb" Tag="Type" Click="OnGroupClick" />
+                                <RadioMenuFlyoutItem x:Name="GroupModifiedItem" Text="Date modified" GroupName="gb" Tag="Modified" Click="OnGroupClick" />
+                                <RadioMenuFlyoutItem x:Name="GroupSizeItem" Text="Size" GroupName="gb" Tag="Size" Click="OnGroupClick" />
+                                <RadioMenuFlyoutItem x:Name="GroupNameItem" Text="Name" GroupName="gb" Tag="Name" Click="OnGroupClick" />
+                            </MenuFlyoutSubItem>
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
+                <Button x:Name="ViewButton" Padding="9,6"
+                        ToolTipService.ToolTip="View" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE8A9;" FontSize="14" />
+                    <Button.Flyout>
+                        <MenuFlyout Placement="Bottom">
+                            <RadioMenuFlyoutItem x:Name="ViewLargeItem" Text="Large icons" GroupName="vm" Tag="LargeIcons" Click="OnViewModeClick" />
+                            <RadioMenuFlyoutItem x:Name="ViewSmallItem" Text="Small icons" GroupName="vm" Tag="SmallIcons" Click="OnViewModeClick" />
+                            <RadioMenuFlyoutItem x:Name="ViewListItem" Text="List" GroupName="vm" Tag="List" Click="OnViewModeClick" />
+                            <RadioMenuFlyoutItem x:Name="ViewDetailsItem" Text="Details" GroupName="vm" Tag="Details" Click="OnViewModeClick" />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
+                <Button x:Name="FavButton" Click="OnOpenFavorites" Padding="9,6"
+                        ToolTipService.ToolTip="Favorites" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE734;" FontSize="14" />
+                </Button>
+                <Button x:Name="SearchButton" Click="OnToggleSearch" Padding="9,6"
+                        ToolTipService.ToolTip="Search (Ctrl+F)" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE721;" FontSize="14" />
+                </Button>
+                <Button x:Name="RefreshButton" Click="OnRefresh" Padding="9,6"
+                        ToolTipService.ToolTip="Refresh (F5 / Ctrl+R)" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE72C;" FontSize="14" />
+                </Button>
+                <Button x:Name="SettingsButton" Click="OnOpenSettings" Padding="9,6"
+                        ToolTipService.ToolTip="Settings" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE713;" FontSize="14" />
+                </Button>
+            </StackPanel>
+        </Grid>
+
+        <!-- Search overlay (Ctrl+F): floats above the list (top-right) like the Win11
+             Notepad find bar, with a slide+fade animation; Esc closes it. It lives on
+             the list row so it overlaps content instead of pushing the layout. -->
+        <Border Grid.Row="4" x:Name="SearchBar" Visibility="Collapsed" Opacity="0"
+                HorizontalAlignment="Right" VerticalAlignment="Top"
+                Margin="0,10,24,0" Padding="8" CornerRadius="8"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+            <Border.RenderTransform>
+                <TranslateTransform x:Name="SearchXform" Y="-16" />
+            </Border.RenderTransform>
+            <AutoSuggestBox x:Name="SearchBox" Width="360" PlaceholderText="Search the current folder…"
+                            QueryIcon="Find"
+                            TextChanged="OnSearchChanged" QuerySubmitted="OnSearchSubmitted"
+                            KeyDown="OnSearchKeyDown" />
+        </Border>
+
+        <ProgressBar Grid.Row="3" x:Name="Busy" IsIndeterminate="True" Visibility="Collapsed" />
+
+        <!-- Column header + list -->
+        <Grid Grid.Row="4">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0" Padding="16,6,16,6" ColumnSpacing="12" HorizontalAlignment="Left"
+                  BorderThickness="0,0,0,1" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="320" />
+                    <ColumnDefinition Width="{Binding SizeLen, Source={StaticResource Cols}}" />
+                    <ColumnDefinition Width="{Binding ModifiedLen, Source={StaticResource Cols}}" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Name" Style="{ThemeResource CaptionTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <Grid Grid.Column="1">
+                    <TextBlock Text="Size" Style="{ThemeResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <Thumb x:Name="SizeThumb" Width="12" HorizontalAlignment="Left" Margin="-12,-6,0,-6"
+                           Background="Transparent" DragDelta="OnSizeThumbDrag">
+                        <Thumb.Template>
+                            <ControlTemplate TargetType="Thumb">
+                                <Border Background="Transparent" />
+                            </ControlTemplate>
+                        </Thumb.Template>
+                    </Thumb>
+                </Grid>
+                <Grid Grid.Column="2">
+                    <TextBlock Text="Modified" Style="{ThemeResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <Thumb x:Name="ModifiedThumb" Width="12" HorizontalAlignment="Left" Margin="-12,-6,0,-6"
+                           Background="Transparent" DragDelta="OnModifiedThumbDrag">
+                        <Thumb.Template>
+                            <ControlTemplate TargetType="Thumb">
+                                <Border Background="Transparent" />
+                            </ControlTemplate>
+                        </Thumb.Template>
+                    </Thumb>
+                </Grid>
+            </Grid>
+
+            <ListView Grid.Row="1" x:Name="FileList"
+                      ItemsSource="{x:Bind Items}"
+                      SelectionMode="Extended"
+                      DoubleTapped="OnItemActivated"
+                      IsDoubleTapEnabled="True"
+                      Tapped="OnListTapped"
+                      RightTapped="OnListRightTapped"
+                      AllowDrop="True"
+                      CanDragItems="False"
+                      CanReorderItems="False"
+                      DragOver="OnListDragOver"
+                      Drop="OnListDrop"
+                      PointerPressed="OnListPointerPressed"
+                      PointerMoved="OnListPointerMoved"
+                      PointerReleased="OnListPointerReleased"
+                      PointerCaptureLost="OnListPointerReleased"
+                      PointerWheelChanged="OnListPointerWheel"
+                      ItemContainerStyle="{StaticResource StackItemStyle}"
+                      ItemTemplateSelector="{StaticResource ItemTemplates}" />
+
+            <!-- Rubber-band (marquee) selection rectangle, drawn over the list when
+                 the user click-drags from empty space. Non-hit-testable so it never
+                 swallows the pointer events driving it. -->
+            <Canvas Grid.Row="1" x:Name="MarqueeLayer" IsHitTestVisible="False">
+                <Border x:Name="MarqueeRect" Visibility="Collapsed"
+                        Background="{ThemeResource AccentFillColorSelectedTextBackgroundBrush}"
+                        BorderThickness="1" BorderBrush="{ThemeResource AccentFillColorDefaultBrush}"
+                        Opacity="0.5" />
+            </Canvas>
+        </Grid>
+
+        <!-- Status bar -->
+        <Border Grid.Row="5" Padding="20,6" BorderThickness="0,1,0,0"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+            <TextBlock x:Name="StatusText" Style="{ThemeResource CaptionTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+        </Border>
+
+        <!-- Modal progress overlay (extract / compress / add). Dims the window and
+             blocks input while a long 7z operation runs; Cancel kills the process. -->
+        <Grid x:Name="ProgressOverlay" Grid.Row="0" Grid.RowSpan="6"
+              Background="#99000000" Visibility="Collapsed" Canvas.ZIndex="10">
+            <Border MinWidth="360" MaxWidth="440" Padding="24" CornerRadius="8"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Background="{ThemeResource LayerFillColorDefaultBrush}"
+                    BorderThickness="1" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock x:Name="ProgressTitle" Text="Working…"
+                               Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <ProgressBar x:Name="ProgressBarCtl" Minimum="0" Maximum="100" Value="0" />
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" x:Name="ProgressPercent" Text="0%"
+                                   FontWeight="SemiBold" />
+                        <TextBlock Grid.Column="1" x:Name="ProgressSize" Text="" TextAlignment="Right"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </Grid>
+                    <TextBlock x:Name="ProgressTime" Text=""
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <Button x:Name="ProgressCancel" Content="Cancel" Click="OnProgressCancel"
+                            HorizontalAlignment="Right" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace FluentZip.Services;
+
+/// <summary>
+/// Thin wrapper around the bundled 7z.exe. Listing uses "-slt" (technical
+/// listing, one "Key = Value" per line) which is stable and easy to parse.
+/// </summary>
+public sealed partial class SevenZipRunner
+{
+    public string ExePath { get; }
+
+    public SevenZipRunner()
+    {
+        ExePath = Path.Combine(AppContext.BaseDirectory, "engine", "7z.exe");
+    }
+
+    public bool EngineAvailable => File.Exists(ExePath);
+
+    public sealed record ArchiveEntry(
+        string Path,
+        long Size,
+        DateTimeOffset? Modified,
+        bool IsDirectory);
+
+    /// <summary>Lists the contents of an archive.</summary>
+    public async Task<IReadOnlyList<ArchiveEntry>> ListAsync(string archivePath, string? password = null)
+    {
+        var (exit, stdout, stderr) = await RunAsync("l", "-slt", "-sccUTF-8", $"-p{password ?? ""}", archivePath);
+        if (exit != 0)
+            throw new InvalidOperationException($"7-Zip could not read the archive (code {exit}).\n{stderr}");
+
+        var entries = new List<ArchiveEntry>();
+        string? path = null;
+        long size = 0;
+        DateTimeOffset? modified = null;
+        bool isDir = false;
+        bool inBody = false;
+
+        void Flush()
+        {
+            if (path is not null)
+                entries.Add(new ArchiveEntry(path, size, modified, isDir));
+            path = null; size = 0; modified = null; isDir = false;
+        }
+
+        foreach (var raw in stdout.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+
+            // The body (per-file records) starts after the first divider line.
+            if (!inBody)
+            {
+                if (line.StartsWith("----------")) inBody = true;
+                continue;
+            }
+
+            if (line.Length == 0) { Flush(); continue; }
+
+            int eq = line.IndexOf(" = ", StringComparison.Ordinal);
+            if (eq < 0) continue;
+            var key = line[..eq];
+            var val = line[(eq + 3)..];
+
+            switch (key)
+            {
+                case "Path": path = val; break;
+                case "Size": long.TryParse(val, out size); break;
+                case "Folder": isDir = val == "+"; break;
+                case "Attributes": if (val.Contains('D')) isDir = true; break;
+                case "Modified":
+                    if (DateTimeOffset.TryParse(val, out var dt)) modified = dt;
+                    break;
+            }
+        }
+        Flush();
+        return entries;
+    }
+
+    /// <summary>Extracts an archive (optionally a subset of entries) into destDir, keeping folder structure.</summary>
+    public async Task ExtractAsync(string archivePath, string destDir, IEnumerable<string>? onlyPaths = null, string? password = null,
+        IProgress<int>? progress = null, CancellationToken ct = default)
+    {
+        Directory.CreateDirectory(destDir);
+        var args = new List<string> { "x", archivePath, $"-o{destDir}", "-y", "-sccUTF-8", $"-p{password ?? ""}" };
+        if (onlyPaths is not null)
+            foreach (var p in onlyPaths)
+                args.Add($"-i!{p}"); // include switch: unambiguous even for names with @/- or spaces
+        var (exit, stderr) = await RunWithProgressAsync(args, progress, ct);
+        if (exit != 0)
+            throw new InvalidOperationException($"Extraction failed (code {exit}).\n{stderr}");
+    }
+
+    /// <summary>Creates (or updates) an archive from the given files/folders.</summary>
+    public async Task CreateAsync(
+        string archivePath,
+        IEnumerable<string> sources,
+        string format = "7z",
+        int level = 5,
+        string? password = null,
+        IProgress<int>? progress = null,
+        CancellationToken ct = default)
+    {
+        var args = new List<string> { "a", $"-t{format}", $"-mx={level}", "-y", "-sccUTF-8" };
+        if (!string.IsNullOrEmpty(password))
+        {
+            args.Add($"-p{password}");
+            if (format.Equals("7z", StringComparison.OrdinalIgnoreCase))
+                args.Add("-mhe=on"); // encrypt headers (7z only)
+        }
+        args.Add(archivePath);
+        args.Add("--"); // stop switch parsing; everything after is a path
+        foreach (var s in sources) args.Add(s);
+
+        var (exit, stderr) = await RunWithProgressAsync(args, progress, ct);
+        if (exit != 0)
+            throw new InvalidOperationException($"Could not create the archive (code {exit}).\n{stderr}");
+    }
+
+    /// <summary>Tests archive integrity (7z t). Returns the tool's report text.</summary>
+    public async Task<(bool ok, string report)> TestAsync(string archivePath, string? password = null)
+    {
+        var args = new List<string> { "t", archivePath, "-sccUTF-8" };
+        if (!string.IsNullOrEmpty(password)) args.Add($"-p{password}");
+        var (exit, stdout, stderr) = await RunAsync(args.ToArray());
+        return (exit == 0, exit == 0 ? stdout : stdout + stderr);
+    }
+
+    /// <summary>Adds files/folders into an existing archive; format is inferred from its extension.</summary>
+    public async Task AddAsync(string archivePath, IEnumerable<string> sources,
+        IProgress<int>? progress = null, CancellationToken ct = default)
+    {
+        var args = new List<string> { "a", "-y", "-sccUTF-8", archivePath, "--" };
+        foreach (var s in sources) args.Add(s);
+        var (exit, stderr) = await RunWithProgressAsync(args, progress, ct);
+        if (exit != 0)
+            throw new InvalidOperationException($"Could not add to the archive (code {exit}).\n{stderr}");
+    }
+
+    /// <summary>Renames an entry inside an archive (7z rn old new).</summary>
+    public async Task RenameEntryAsync(string archivePath, string oldPath, string newPath)
+    {
+        var (exit, _, stderr) = await RunAsync("rn", archivePath, "-y", "-sccUTF-8", oldPath, newPath);
+        if (exit != 0)
+            throw new InvalidOperationException($"Could not rename inside the archive (code {exit}).\n{stderr}");
+    }
+
+    /// <summary>Deletes entries from an archive (7z d).</summary>
+    public async Task DeleteEntriesAsync(string archivePath, IEnumerable<string> entryPaths)
+    {
+        var args = new List<string> { "d", archivePath, "-y", "-sccUTF-8", "--" };
+        foreach (var p in entryPaths) args.Add(p);
+        var (exit, _, stderr) = await RunAsync(args.ToArray());
+        if (exit != 0)
+            throw new InvalidOperationException($"Could not delete from the archive (code {exit}).\n{stderr}");
+    }
+
+    private async Task<(int exit, string stdout, string stderr)> RunAsync(params string[] args)
+    {
+        if (!EngineAvailable)
+            throw new FileNotFoundException("The 7z.exe engine was not found", ExePath);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = ExePath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+
+        using var proc = new Process { StartInfo = psi };
+        var outSb = new StringBuilder();
+        var errSb = new StringBuilder();
+        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) outSb.AppendLine(e.Data); };
+        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) errSb.AppendLine(e.Data); };
+        proc.Start();
+        proc.StandardInput.Close(); // never block on a password prompt; a wrong/empty -p fails fast instead
+        proc.BeginOutputReadLine();
+        proc.BeginErrorReadLine();
+        await proc.WaitForExitAsync();
+        return (proc.ExitCode, outSb.ToString(), errSb.ToString());
+    }
+
+    [GeneratedRegex(@"(\d{1,3})%")]
+    private static partial Regex PercentRegex();
+
+    /// <summary>
+    /// Runs 7z for a long operation, reporting the overall percentage. With "-bsp1"
+    /// 7z writes progress to stdout, updating one console line via '\r'/'\b'; we read
+    /// the stream in raw chunks, split on those control chars, and pull the percent
+    /// out of each segment. Cancellation kills the process.
+    /// </summary>
+    private async Task<(int exit, string stderr)> RunWithProgressAsync(
+        IReadOnlyList<string> args, IProgress<int>? progress, CancellationToken ct)
+    {
+        if (!EngineAvailable)
+            throw new FileNotFoundException("The 7z.exe engine was not found", ExePath);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = ExePath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+        if (progress is not null) psi.ArgumentList.Add("-bsp1"); // progress → stdout
+        foreach (var a in args) psi.ArgumentList.Add(a);
+
+        using var proc = new Process { StartInfo = psi };
+        var errSb = new StringBuilder();
+        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) errSb.AppendLine(e.Data); };
+        proc.Start();
+        proc.StandardInput.Close();
+        proc.BeginErrorReadLine();
+
+        // Kill the process if the user cancels.
+        using var reg = ct.Register(() => { try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { } });
+
+        // Read stdout in raw chunks so '\r'/'\b'-refreshed progress is visible.
+        var stdout = proc.StandardOutput;
+        var buf = new char[512];
+        var seg = new StringBuilder();
+        int lastPct = -1;
+        int n;
+        while ((n = await stdout.ReadAsync(buf, 0, buf.Length)) > 0)
+        {
+            for (int k = 0; k < n; k++)
+            {
+                char c = buf[k];
+                if (c is '\r' or '\n' or '\b')
+                {
+                    ReportSegment(seg, ref lastPct, progress);
+                    seg.Clear();
+                }
+                else seg.Append(c);
+            }
+        }
+        ReportSegment(seg, ref lastPct, progress);
+
+        await proc.WaitForExitAsync(CancellationToken.None);
+        if (ct.IsCancellationRequested)
+            throw new OperationCanceledException(ct);
+        return (proc.ExitCode, errSb.ToString());
+    }
+
+    private static void ReportSegment(StringBuilder seg, ref int lastPct, IProgress<int>? progress)
+    {
+        if (progress is null || seg.Length == 0) return;
+        var m = PercentRegex().Match(seg.ToString());
+        if (!m.Success) return;
+        if (int.TryParse(m.Groups[1].Value, out int pct) && pct is >= 0 and <= 100 && pct != lastPct)
+        {
+            lastPct = pct;
+            progress.Report(pct);
+        }
+    }
+}

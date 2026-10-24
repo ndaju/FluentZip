@@ -1,0 +1,2349 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.UI.Windowing;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.Foundation;
+using Windows.Storage;
+using Windows.System;
+using FluentZip.Models;
+using FluentZip.Services;
+
+namespace FluentZip;
+
+public sealed partial class MainWindow : Window
+{
+    private static readonly HashSet<string> ArchiveExts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".7z", ".zip", ".rar", ".gz", ".tar", ".bz2", ".xz", ".tgz", ".tbz",
+        ".cab", ".iso", ".wim", ".lzh", ".lzma", ".arj", ".z", ".zst", ".001"
+    };
+
+    private enum View { Drives, Folder, Archive, Favorites }
+
+    private readonly SevenZipRunner _engine = new();
+    private readonly AppSettings _settings = AppSettings.Load();
+
+    public ObservableCollection<FileItem> Items { get; } = new();
+
+    // Navigation state.
+    private View _view = View.Drives;
+    private string? _currentDir;
+    private string? _openArchive;
+    private IReadOnlyList<SevenZipRunner.ArchiveEntry> _archiveEntries = Array.Empty<SevenZipRunner.ArchiveEntry>();
+    private string _archiveSubPath = "";       // "" = archive root, otherwise "dir\sub\"
+
+    // Back / forward history. Each entry restores a view and its scroll offset.
+    private sealed record NavEntry(Action Restore, double Scroll);
+    private readonly Stack<NavEntry> _back = new();
+    private readonly Stack<NavEntry> _forward = new();
+    private ScrollViewer? _listScroll;
+
+    // Search + status.
+    private readonly List<FileItem> _rawItems = new();  // current view's real items (no ".."/headers), pre-order
+    private List<FileItem> _snapshot = new();  // unfiltered items for the current view
+    private string _search = "";
+
+    // Canonical text for the path box at the current location, restored if the user
+    // edits the box and clicks away without submitting.
+    private string _locationText = "This PC";
+
+    // Password for the currently open archive (null = none / not yet asked).
+    private string? _archivePassword;
+
+    // Internal clipboard for cut/copy/paste.
+    private List<string> _clip = new();
+    private bool _clipCut;
+
+    // Cancels the background folder-size pass when the user navigates away.
+    private System.Threading.CancellationTokenSource? _sizeCts;
+
+    public MainWindow()
+    {
+        this.InitializeComponent();
+
+        // A solid themed root background (set in XAML) is used instead of a Mica
+        // backdrop: Mica initialises a frame late, which showed a black flash on
+        // open/close. The solid background paints from the first frame.
+        this.ExtendsContentIntoTitleBar = true;
+        this.SetTitleBar(AppTitleBar);
+        this.Title = "FluentZip";
+        SetWindowIcon();
+
+        if (AppWindow.Presenter is OverlappedPresenter presenter)
+            presenter.IsAlwaysOnTop = false;
+
+        FileList.SelectionChanged += OnSelectionChanged;
+        // handledEventsToo: the ListView marks Space/arrows handled for selection, so a
+        // plain KeyDown subscription never sees Space — this still fires for preview.
+        FileList.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnListKeyDown), handledEventsToo: true);
+
+        AddAccel(VirtualKey.F, VirtualKeyModifiers.Control, (_, a) => { ToggleSearch(true); a.Handled = true; });
+        AddAccel(VirtualKey.R, VirtualKeyModifiers.Control, (_, a) => { RefreshCurrent(); a.Handled = true; });
+        AddAccel(VirtualKey.L, VirtualKeyModifiers.Control, (_, a) => { PathBox.Focus(FocusState.Programmatic); a.Handled = true; });
+        AddAccel(VirtualKey.Left, VirtualKeyModifiers.Menu, (_, a) => { OnBack(this, null!); a.Handled = true; });
+        AddAccel(VirtualKey.Right, VirtualKeyModifiers.Menu, (_, a) => { OnForward(this, null!); a.Handled = true; });
+        AddAccel(VirtualKey.Enter, VirtualKeyModifiers.Menu, (_, a) => { ShowPropertiesForSelection(); a.Handled = true; });
+
+        ApplyTheme(ParseTheme(_settings.Theme));
+        SetupItemViews();
+        OpenFromCommandLine();
+    }
+
+    private void AddAccel(VirtualKey key, VirtualKeyModifiers mods, TypedEventHandler<KeyboardAccelerator, KeyboardAcceleratorInvokedEventArgs> handler)
+    {
+        var acc = new KeyboardAccelerator { Key = key, Modifiers = mods };
+        acc.Invoked += handler;
+        RootGrid.KeyboardAccelerators.Add(acc);
+    }
+
+    private void SetWindowIcon()
+    {
+        try
+        {
+            var ico = Path.Combine(AppContext.BaseDirectory, "app.ico");
+            if (File.Exists(ico)) AppWindow.SetIcon(ico);
+        }
+        catch { /* icon is cosmetic */ }
+    }
+
+    private void OpenFromCommandLine()
+    {
+        var args = Environment.GetCommandLineArgs();
+
+        // "Add to archive" Explorer verb: --compress <path> [<path> ...]
+        if (args.Length >= 3 && args[1] == "--compress")
+        {
+            var sources = args.Skip(2).Where(p => File.Exists(p) || Directory.Exists(p)).ToList();
+            var dir = sources.Count > 0 ? Path.GetDirectoryName(sources[0].TrimEnd('\\')) : null;
+            if (dir is not null && Directory.Exists(dir))
+            {
+                NavigateToFolder(dir, pushHistory: false);
+                var set = new HashSet<string>(sources.Select(s => s.TrimEnd('\\')), StringComparer.OrdinalIgnoreCase);
+                FileList.SelectedItems.Clear();
+                foreach (var it in Items.Where(i => set.Contains(i.FullPath.TrimEnd('\\'))))
+                    FileList.SelectedItems.Add(it);
+                DispatcherQueue.TryEnqueue(() => OnCompress(this, null!));
+                return;
+            }
+        }
+
+        if (args.Length > 1 && !args[1].StartsWith("--"))
+        {
+            var target = args[1];
+            if (Directory.Exists(target)) { NavigateToFolder(target, pushHistory: false); return; }
+            if (File.Exists(target) && IsArchive(target)) { _ = OpenArchiveAsync(target, pushHistory: false); return; }
+            if (File.Exists(target))
+            {
+                var dir = Path.GetDirectoryName(target);
+                if (dir is not null) { NavigateToFolder(dir, pushHistory: false); return; }
+            }
+        }
+
+        // Reopen the last folder, like the original 7-Zip file manager.
+        if (!string.IsNullOrEmpty(_settings.LastPath) && Directory.Exists(_settings.LastPath))
+        {
+            NavigateToFolder(_settings.LastPath, pushHistory: false);
+            return;
+        }
+
+        ShowDrives(pushHistory: false);
+    }
+
+    // ---------- Theme ----------
+
+    private static ElementTheme ParseTheme(string s) => s switch
+    {
+        "Light" => ElementTheme.Light,
+        "Dark" => ElementTheme.Dark,
+        _ => ElementTheme.Default,
+    };
+
+    private void ApplyTheme(ElementTheme theme)
+    {
+        RootGrid.RequestedTheme = theme;
+        ApplyCaptionColors(RootGrid.ActualTheme == ElementTheme.Dark);
+    }
+
+    // Custom title bars leave the min/max/close glyphs at their default colours,
+    // which wash out on a light Mica background. Paint them by theme.
+    private void ApplyCaptionColors(bool dark)
+    {
+        var tb = AppWindow.TitleBar;
+        var fg = dark ? Windows.UI.Color.FromArgb(255, 255, 255, 255) : Windows.UI.Color.FromArgb(255, 32, 32, 32);
+        var fgInactive = dark ? Windows.UI.Color.FromArgb(255, 155, 155, 155) : Windows.UI.Color.FromArgb(255, 130, 130, 130);
+        var hover = dark ? Windows.UI.Color.FromArgb(30, 255, 255, 255) : Windows.UI.Color.FromArgb(25, 0, 0, 0);
+        var pressed = dark ? Windows.UI.Color.FromArgb(50, 255, 255, 255) : Windows.UI.Color.FromArgb(45, 0, 0, 0);
+        tb.ButtonForegroundColor = fg;
+        tb.ButtonInactiveForegroundColor = fgInactive;
+        tb.ButtonHoverForegroundColor = fg;
+        tb.ButtonPressedForegroundColor = fg;
+        tb.ButtonBackgroundColor = Windows.UI.Color.FromArgb(0, 0, 0, 0);
+        tb.ButtonInactiveBackgroundColor = Windows.UI.Color.FromArgb(0, 0, 0, 0);
+        tb.ButtonHoverBackgroundColor = hover;
+        tb.ButtonPressedBackgroundColor = pressed;
+    }
+
+    // ---------- Column resize ----------
+
+    private void OnSizeThumbDrag(object sender, DragDeltaEventArgs e)
+    {
+        if (App.Cols is { } c) c.Size -= e.HorizontalChange;
+    }
+
+    private void OnModifiedThumbDrag(object sender, DragDeltaEventArgs e)
+    {
+        if (App.Cols is { } c) c.Modified -= e.HorizontalChange;
+    }
+
+    // ---------- Navigation ----------
+
+    private void ShowDrives(bool pushHistory = true)
+    {
+        if (pushHistory) PushCurrent();
+        ClearSearch();
+        CancelFolderSizing();
+        _view = View.Drives;
+        _currentDir = null; _openArchive = null;
+        Items.Clear();
+        Items.Add(new FileItem { Name = "Favorites", FullPath = "::favorites", Kind = ItemKind.Favorites });
+        foreach (var d in DriveInfo.GetDrives().Where(d => d.IsReady))
+        {
+            Items.Add(new FileItem
+            {
+                Name = string.IsNullOrWhiteSpace(d.VolumeLabel) ? d.Name : $"{d.VolumeLabel} ({d.Name.TrimEnd('\\')})",
+                FullPath = d.RootDirectory.FullName,
+                Kind = ItemKind.Drive,
+            });
+        }
+        SetPath("This PC");
+        SetStatus($"Drives: {Items.Count - 1}");
+        UpdateCommandState();
+        SnapshotItems();
+    }
+
+    private void ShowFavorites(bool pushHistory = true)
+    {
+        if (pushHistory) PushCurrent();
+        ClearSearch();
+        CancelFolderSizing();
+        _view = View.Favorites;
+        _currentDir = null; _openArchive = null;
+        Items.Clear();
+        Items.Add(new FileItem { Name = "..", FullPath = "..", Kind = ItemKind.UpDir });
+        foreach (var f in _settings.Favorites)
+        {
+            bool exists = f.Kind == ItemKind.Folder ? Directory.Exists(f.Path) : File.Exists(f.Path);
+            Items.Add(new FileItem
+            {
+                Name = f.Name,
+                FullPath = f.Path,
+                Kind = f.Kind,
+                Subtitle = f.Path,
+                Modified = exists ? (f.Kind == ItemKind.Folder ? new DirectoryInfo(f.Path).LastWriteTime : new FileInfo(f.Path).LastWriteTime) : null,
+                Size = exists && f.Kind != ItemKind.Folder ? new FileInfo(f.Path).Length : 0,
+            });
+        }
+        SetPath("Favorites");
+        SetStatus($"Favorites: {_settings.Favorites.Count}");
+        UpdateCommandState();
+        SnapshotItems();
+    }
+
+    private void NavigateToFolder(string path, bool pushHistory = true)
+    {
+        try
+        {
+            var dir = new DirectoryInfo(path);
+            if (!dir.Exists) { ShowDrives(); return; }
+            if (pushHistory) PushCurrent();
+            ClearSearch();
+
+            CancelFolderSizing();
+            _view = View.Folder;
+            _currentDir = dir.FullName;
+            _openArchive = null;
+
+            _rawItems.Clear();
+            foreach (var sub in dir.EnumerateDirectories())
+            {
+                if (!_settings.ShowHidden && (sub.Attributes & (System.IO.FileAttributes.Hidden | System.IO.FileAttributes.System)) != 0) continue;
+                _rawItems.Add(new FileItem { Name = sub.Name, FullPath = sub.FullName, Kind = ItemKind.Folder, Modified = sub.LastWriteTime });
+            }
+            foreach (var f in dir.EnumerateFiles())
+            {
+                if (!_settings.ShowHidden && (f.Attributes & (System.IO.FileAttributes.Hidden | System.IO.FileAttributes.System)) != 0) continue;
+                _rawItems.Add(new FileItem
+                {
+                    Name = f.Name, FullPath = f.FullName,
+                    Kind = IsArchive(f.Name) ? ItemKind.Archive : ItemKind.File,
+                    Size = f.Length, Modified = f.LastWriteTime,
+                });
+            }
+            SetPath(dir.FullName);
+            ApplyOrdering();
+            SetStatus($"Items: {_rawItems.Count}");
+
+            if (_settings.LastPath != dir.FullName) { _settings.LastPath = dir.FullName; _settings.Save(); }
+            StartFolderSizing();
+        }
+        catch (Exception ex)
+        {
+            _ = ShowError("Could not open the folder", ex.Message);
+        }
+    }
+
+    private void CancelFolderSizing()
+    {
+        _sizeCts?.Cancel();
+        _sizeCts?.Dispose();
+        _sizeCts = null;
+    }
+
+    // Computes recursive folder sizes off the UI thread and pushes each result back
+    // as it lands, so the list stays responsive on directories with huge subtrees.
+    private void StartFolderSizing()
+    {
+        var folders = _rawItems.Where(i => i.Kind == ItemKind.Folder).ToList();
+        if (folders.Count == 0) return;
+
+        _sizeCts = new System.Threading.CancellationTokenSource();
+        var token = _sizeCts.Token;
+        var dq = DispatcherQueue;
+
+        Task.Run(() =>
+        {
+            foreach (var f in folders)
+            {
+                if (token.IsCancellationRequested) return;
+                long total = DirectorySize(f.FullPath, token);
+                if (token.IsCancellationRequested) return;
+                dq.TryEnqueue(() => { if (!token.IsCancellationRequested) f.FolderSize = total; });
+            }
+        }, token);
+    }
+
+    private static long DirectorySize(string path, System.Threading.CancellationToken token)
+    {
+        long total = 0;
+        try
+        {
+            var opts = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = System.IO.FileAttributes.ReparsePoint, // don't follow junctions/symlinks
+            };
+            foreach (var file in new DirectoryInfo(path).EnumerateFiles("*", opts))
+            {
+                if (token.IsCancellationRequested) break;
+                total += file.Length;
+            }
+        }
+        catch { /* size stays at what we managed to sum */ }
+        return total;
+    }
+
+    private async Task OpenArchiveAsync(string archivePath, bool pushHistory = true)
+    {
+        SetBusy(true);
+        try
+        {
+            string? password = null;
+            IReadOnlyList<SevenZipRunner.ArchiveEntry> entries;
+            try { entries = await _engine.ListAsync(archivePath, null); }
+            catch (Exception ex) when (IsPasswordError(ex))
+            {
+                // Header-encrypted archive: names are unreadable without the password.
+                var pw = await AskPasswordAsync();
+                if (pw is null) { SetBusy(false); return; }
+                entries = await _engine.ListAsync(archivePath, pw);
+                password = pw;
+            }
+            if (pushHistory) PushCurrent();
+            CancelFolderSizing();
+            _view = View.Archive;
+            _openArchive = archivePath;
+            _archivePassword = password;
+            _archiveEntries = entries;
+            _archiveSubPath = "";
+            RenderArchiveLevel();
+        }
+        catch (Exception ex)
+        {
+            await ShowError("Could not open the archive", ex.Message);
+        }
+        finally { SetBusy(false); }
+    }
+
+    private async Task RestoreArchiveAsync(string archivePath, string subPath)
+    {
+        await OpenArchiveAsync(archivePath, pushHistory: false);
+        if (_view == View.Archive && _openArchive == archivePath && subPath.Length > 0)
+        {
+            _archiveSubPath = subPath;
+            RenderArchiveLevel();
+        }
+    }
+
+    private async Task ReloadArchiveAsync()
+    {
+        if (_openArchive is null) return;
+        _archiveEntries = await _engine.ListAsync(_openArchive);
+        RenderArchiveLevel();
+    }
+
+    private void RenderArchiveLevel()
+    {
+        ClearSearch();
+        var prefix = _archiveSubPath;
+        var folders = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var files = new List<FileItem>();
+        foreach (var e in _archiveEntries)
+        {
+            var p = e.Path.Replace('/', '\\');
+            if (prefix.Length > 0 && !p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            var rest = p.Substring(prefix.Length);
+            if (rest.Length == 0) continue;
+            int slash = rest.IndexOf('\\');
+            if (slash >= 0) { folders.Add(rest[..slash]); }
+            else if (e.IsDirectory) { folders.Add(rest); }
+            else
+            {
+                files.Add(new FileItem
+                {
+                    Name = rest, FullPath = p,
+                    Kind = IsArchive(rest) ? ItemKind.Archive : ItemKind.File,
+                    Size = e.Size, Modified = e.Modified,
+                });
+            }
+        }
+
+        _rawItems.Clear();
+        foreach (var f in folders)
+            _rawItems.Add(new FileItem { Name = f, FullPath = prefix + f, Kind = ItemKind.Folder });
+        _rawItems.AddRange(files);
+
+        SetPath(prefix.Length > 0 ? $"{_openArchive}\\{prefix.TrimEnd('\\')}" : _openArchive!);
+        ApplyOrdering();
+        SetStatus($"Archive: {files.Count} files, {folders.Count} folders");
+    }
+
+    private void OnItemActivated(object sender, DoubleTappedRoutedEventArgs e)
+        => ActivateItem(FileList.SelectedItem as FileItem);
+
+    private void ActivateItem(FileItem? item)
+    {
+        if (item is null) return;
+        switch (item.Kind)
+        {
+            case ItemKind.UpDir: OnUp(this, null!); break;
+            case ItemKind.Favorites: ShowFavorites(); break;
+            case ItemKind.Drive: NavigateToFolder(item.FullPath); break;
+            case ItemKind.Folder when _view == View.Archive:
+                _archiveSubPath = item.FullPath + "\\"; RenderArchiveLevel(); break;
+            case ItemKind.Folder when _view == View.Favorites:
+                NavigateToFolder(item.FullPath); break;
+            case ItemKind.Folder:
+                NavigateToFolder(item.FullPath); break;
+            case ItemKind.Archive when _view == View.Favorites:
+                _ = OpenArchiveAsync(item.FullPath); break;
+            case ItemKind.Archive when _view == View.Folder:
+                _ = OpenArchiveAsync(item.FullPath); break;
+            case ItemKind.Archive: // inside another archive: extract+open
+            case ItemKind.File when _view == View.Archive:
+                _ = ViewArchiveEntryAsync(item); break;
+            case ItemKind.File:
+                LaunchPath(item.FullPath); break;
+        }
+    }
+
+    private void OnUp(object sender, RoutedEventArgs e)
+    {
+        switch (_view)
+        {
+            case View.Archive when _archiveSubPath.Length > 0:
+                var trimmed = _archiveSubPath.TrimEnd('\\');
+                int i = trimmed.LastIndexOf('\\');
+                _archiveSubPath = i >= 0 ? trimmed[..(i + 1)] : "";
+                RenderArchiveLevel();
+                break;
+            case View.Archive:
+                var folder = Path.GetDirectoryName(_openArchive);
+                if (folder is not null) NavigateToFolder(folder); else ShowDrives();
+                break;
+            case View.Favorites:
+                ShowDrives();
+                break;
+            case View.Folder:
+                var parent = _currentDir is null ? null : Directory.GetParent(_currentDir);
+                if (parent is not null) NavigateToFolder(parent.FullName); else ShowDrives();
+                break;
+        }
+    }
+
+    private void OnBack(object sender, RoutedEventArgs e)
+    {
+        if (_back.Count == 0) return;
+        _forward.Push(CaptureCurrent());
+        var entry = _back.Pop();
+        entry.Restore();
+        RestoreScroll(entry.Scroll);
+    }
+
+    private void OnForward(object sender, RoutedEventArgs e)
+    {
+        if (_forward.Count == 0) return;
+        _back.Push(CaptureCurrent());
+        var entry = _forward.Pop();
+        entry.Restore();
+        RestoreScroll(entry.Scroll);
+    }
+
+    // Mouse side buttons: X1 = back, X2 = forward.
+    private void OnRootPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        var props = e.GetCurrentPoint(RootGrid).Properties;
+        if (props.IsXButton1Pressed) { OnBack(this, null!); e.Handled = true; }
+        else if (props.IsXButton2Pressed) { OnForward(this, null!); e.Handled = true; }
+    }
+
+    private ScrollViewer? ListScroll => _listScroll ??= FindScrollViewer(FileList);
+
+    private static ScrollViewer? FindScrollViewer(DependencyObject root)
+    {
+        if (root is ScrollViewer sv) return sv;
+        int n = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < n; i++)
+        {
+            var child = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(root, i);
+            var r = FindScrollViewer(child);
+            if (r is not null) return r;
+        }
+        return null;
+    }
+
+    private void RestoreScroll(double offset)
+    {
+        // Items repopulate synchronously for folders; give layout a beat, then scroll.
+        DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
+            () => ListScroll?.ChangeView(null, offset, null, disableAnimation: true));
+    }
+
+    private void OnRefresh(object sender, RoutedEventArgs e) => RefreshCurrent();
+
+    // ---------- Search ----------
+
+    private void OnToggleSearch(object sender, RoutedEventArgs e) => ToggleSearch(SearchBar.Visibility != Visibility.Visible);
+
+    private void ToggleSearch(bool show)
+    {
+        if (show)
+        {
+            SearchBox.ItemsSource = _settings.SearchHistory;
+            SearchBar.Opacity = 0;
+            SearchXform.Y = -16;
+            SearchBar.Visibility = Visibility.Visible;
+            AnimateSearch(true, null);
+            SearchBox.Focus(FocusState.Programmatic);
+        }
+        else
+        {
+            AnimateSearch(false, () =>
+            {
+                ClearSearch();               // resets the term and hides the bar
+                FileList.Focus(FocusState.Programmatic);
+            });
+        }
+    }
+
+    // Slide + fade the floating search bar in/out, Win11 Notepad style.
+    private void AnimateSearch(bool show, Action? onDone)
+    {
+        var sb = new Microsoft.UI.Xaml.Media.Animation.Storyboard();
+
+        var fade = new Microsoft.UI.Xaml.Media.Animation.DoubleAnimation
+        {
+            To = show ? 1 : 0,
+            Duration = TimeSpan.FromMilliseconds(show ? 140 : 110),
+            EasingFunction = new Microsoft.UI.Xaml.Media.Animation.CubicEase
+            { EasingMode = Microsoft.UI.Xaml.Media.Animation.EasingMode.EaseOut },
+        };
+        Microsoft.UI.Xaml.Media.Animation.Storyboard.SetTarget(fade, SearchBar);
+        Microsoft.UI.Xaml.Media.Animation.Storyboard.SetTargetProperty(fade, "Opacity");
+        sb.Children.Add(fade);
+
+        var slide = new Microsoft.UI.Xaml.Media.Animation.DoubleAnimation
+        {
+            To = show ? 0 : -16,
+            Duration = TimeSpan.FromMilliseconds(show ? 160 : 110),
+            EasingFunction = new Microsoft.UI.Xaml.Media.Animation.CubicEase
+            { EasingMode = show ? Microsoft.UI.Xaml.Media.Animation.EasingMode.EaseOut
+                                : Microsoft.UI.Xaml.Media.Animation.EasingMode.EaseIn },
+        };
+        Microsoft.UI.Xaml.Media.Animation.Storyboard.SetTarget(slide, SearchXform);
+        Microsoft.UI.Xaml.Media.Animation.Storyboard.SetTargetProperty(slide, "Y");
+        sb.Children.Add(slide);
+
+        if (onDone is not null) sb.Completed += (_, _) => onDone();
+        sb.Begin();
+    }
+
+    // Move initial focus off the path box so it isn't active when the app opens.
+    // Deferred so it runs after the window finishes activating (otherwise the path
+    // box, first in tab order, reclaims focus).
+    private void OnRootLoaded(object sender, RoutedEventArgs e) =>
+        DispatcherQueue.TryEnqueue(() => FileList.Focus(FocusState.Programmatic));
+
+    // Reset the search term and hide the bar; used both on close and on navigation.
+    private void ClearSearch()
+    {
+        _search = "";
+        SearchBar.Visibility = Visibility.Collapsed;
+        if (SearchBox.Text.Length > 0) SearchBox.Text = "";
+        ApplySearch();
+    }
+
+    private void OnSearchChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
+    {
+        if (args.Reason == AutoSuggestionBoxTextChangeReason.ProgrammaticChange) return;
+        _search = sender.Text ?? "";
+        var q = _search.Trim();
+        sender.ItemsSource = q.Length == 0
+            ? _settings.SearchHistory
+            : _settings.SearchHistory.Where(h => h.Contains(q, StringComparison.OrdinalIgnoreCase)).ToList();
+        ApplySearch();
+    }
+
+    private void OnSearchSubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
+    {
+        var term = (args.QueryText ?? sender.Text ?? "").Trim();
+        if (term.Length > 0) AddSearchHistory(term);
+        var first = Items.FirstOrDefault(i => i.Kind != ItemKind.UpDir);
+        if (first is not null) FileList.SelectedItem = first;
+    }
+
+    private void AddSearchHistory(string term)
+    {
+        _settings.SearchHistory.RemoveAll(h => string.Equals(h, term, StringComparison.OrdinalIgnoreCase));
+        _settings.SearchHistory.Insert(0, term);
+        if (_settings.SearchHistory.Count > 8)
+            _settings.SearchHistory.RemoveRange(8, _settings.SearchHistory.Count - 8);
+        _settings.Save();
+    }
+
+    private void OnSearchKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == VirtualKey.Escape) { ToggleSearch(false); e.Handled = true; }
+    }
+
+    // Store the unfiltered items for the current view, then re-apply any live filter.
+    private void SnapshotItems()
+    {
+        _snapshot = Items.ToList();
+        if (!string.IsNullOrEmpty(_search)) ApplySearch();
+    }
+
+    private void ApplySearch()
+    {
+        var term = _search.Trim();
+        Items.Clear();
+        foreach (var it in _snapshot)
+        {
+            if (it.Kind is ItemKind.UpDir or ItemKind.Favorites
+                || term.Length == 0
+                || it.Name.Contains(term, StringComparison.OrdinalIgnoreCase))
+            {
+                // While filtering, drop group headers (their groups may be empty now).
+                if (term.Length > 0 && it.Kind == ItemKind.Header) continue;
+                Items.Add(it);
+            }
+        }
+    }
+
+    // ---------- Sorting / grouping ----------
+
+    // Builds the visible Items list from _rawItems applying the current sort and
+    // grouping settings. The ".." row (folder/archive views) always leads.
+    private void ApplyOrdering()
+    {
+        Items.Clear();
+        if (_view is View.Folder or View.Archive)
+            Items.Add(new FileItem { Name = "..", FullPath = "..", Kind = ItemKind.UpDir });
+
+        if (_settings.GroupBy == "None")
+        {
+            foreach (var it in SortFlat(_rawItems, foldersFirst: true)) Items.Add(it);
+        }
+        else
+        {
+            var groups = _rawItems
+                .GroupBy(GroupOf)
+                .OrderBy(g => g.Key.order)
+                .ThenBy(g => g.Key.label, StringComparer.OrdinalIgnoreCase);
+            foreach (var g in groups)
+            {
+                Items.Add(new FileItem { Kind = ItemKind.Header, Name = g.Key.label });
+                foreach (var it in SortFlat(g, foldersFirst: false)) Items.Add(it);
+            }
+        }
+        SnapshotItems();
+        UpdateCommandState();
+    }
+
+    private List<FileItem> SortFlat(IEnumerable<FileItem> src, bool foldersFirst)
+    {
+        bool desc = _settings.SortDescending;
+        IOrderedEnumerable<FileItem> o = src.OrderBy(i => foldersFirst && i.Kind == ItemKind.Folder ? 0 : 1);
+        o = _settings.SortField switch
+        {
+            "Modified" => desc ? o.ThenByDescending(i => i.Modified ?? DateTimeOffset.MinValue)
+                               : o.ThenBy(i => i.Modified ?? DateTimeOffset.MinValue),
+            "Type" => desc ? o.ThenByDescending(i => i.Ext, StringComparer.OrdinalIgnoreCase)
+                           : o.ThenBy(i => i.Ext, StringComparer.OrdinalIgnoreCase),
+            "Size" => desc ? o.ThenByDescending(i => i.Kind == ItemKind.Folder ? (i.FolderSize ?? 0) : i.Size)
+                           : o.ThenBy(i => i.Kind == ItemKind.Folder ? (i.FolderSize ?? 0) : i.Size),
+            _ => desc ? o.ThenByDescending(i => i.Name, StringComparer.OrdinalIgnoreCase)
+                      : o.ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase),
+        };
+        return o.ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    // (order, label) for the current GroupBy — order sorts the groups, label names them.
+    private (int order, string label) GroupOf(FileItem it)
+    {
+        switch (_settings.GroupBy)
+        {
+            case "Type":
+                return it.Kind == ItemKind.Folder ? (0, "Folders") : (1, it.TypeText.Length > 0 ? it.TypeText : "Files");
+            case "Modified":
+                return ModifiedBucket(it.Modified);
+            case "Size":
+                return SizeBucket(it);
+            case "Name":
+                {
+                    var c = string.IsNullOrEmpty(it.Name) ? '#' : char.ToUpperInvariant(it.Name[0]);
+                    return char.IsLetter(c) ? (1, c.ToString()) : (0, "#");
+                }
+            default:
+                return (0, "");
+        }
+    }
+
+    private static (int order, string label) ModifiedBucket(DateTimeOffset? mod)
+    {
+        if (mod is null) return (9, "Unknown");
+        var d = mod.Value.LocalDateTime.Date;
+        var today = DateTime.Today;
+        if (d == today) return (0, "Today");
+        if (d == today.AddDays(-1)) return (1, "Yesterday");
+        if (d >= today.AddDays(-7)) return (2, "This week");
+        if (d >= today.AddDays(-30)) return (3, "This month");
+        if (d.Year == today.Year) return (4, "This year");
+        return (5, "A long time ago");
+    }
+
+    private static (int order, string label) SizeBucket(FileItem it)
+    {
+        if (it.Kind == ItemKind.Folder) return (0, "Folders");
+        long s = it.Size;
+        if (s == 0) return (1, "Empty");
+        if (s < 16L * 1024) return (2, "Tiny (<16 KB)");
+        if (s < 1L * 1024 * 1024) return (3, "Small (<1 MB)");
+        if (s < 128L * 1024 * 1024) return (4, "Medium (<128 MB)");
+        if (s < 1L * 1024 * 1024 * 1024) return (5, "Large (<1 GB)");
+        return (6, "Huge (>1 GB)");
+    }
+
+    private void RefreshCurrent()
+    {
+        switch (_view)
+        {
+            case View.Archive: _ = ReloadArchiveAsync(); break;
+            case View.Folder when _currentDir is not null: NavigateToFolder(_currentDir, pushHistory: false); break;
+            case View.Favorites: ShowFavorites(pushHistory: false); break;
+            default: ShowDrives(pushHistory: false); break;
+        }
+    }
+
+    private void OnPathTextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
+    {
+        if (args.Reason != AutoSuggestionBoxTextChangeReason.UserInput) return;
+        sender.ItemsSource = SuggestPaths(sender.Text);
+    }
+
+    private void OnPathSuggestionChosen(AutoSuggestBox sender, AutoSuggestBoxSuggestionChosenEventArgs args)
+    {
+        if (args.SelectedItem is string s) sender.Text = s;
+    }
+
+    // Set the path box and remember it as the canonical text for the current location.
+    private void SetPath(string text) { _locationText = text; PathBox.Text = text; }
+
+    // The user cleared or half-typed a path and clicked away without submitting: snap back.
+    private void OnPathLostFocus(object sender, RoutedEventArgs e)
+    {
+        if (PathBox.Text != _locationText) PathBox.Text = _locationText;
+    }
+
+    private void OnPathQuerySubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
+    {
+        var text = (args.ChosenSuggestion as string ?? sender.Text ?? "").Trim().Trim('"');
+        if (string.IsNullOrEmpty(text)) return;
+        if (text is "This PC" or "Favorites") { ShowDrives(); return; }
+        if (Directory.Exists(text)) { NavigateToFolder(text); return; }
+        if (File.Exists(text) && IsArchive(text)) { _ = OpenArchiveAsync(text); return; }
+        if (File.Exists(text)) { LaunchPath(text); return; }
+        _ = ShowError("Path not found", $"Could not navigate to:\n{text}");
+    }
+
+    // Live folder suggestions as the user types a path (e.g. "C:\" -> C:\Users, ...).
+    private static List<string> SuggestPaths(string text)
+    {
+        var result = new List<string>();
+        try
+        {
+            if (string.IsNullOrWhiteSpace(text)) return result;
+            text = text.Trim().Trim('"');
+            string dir, prefix;
+            if (Directory.Exists(text) && (text.EndsWith('\\') || text.EndsWith('/')))
+            { dir = text; prefix = ""; }
+            else
+            {
+                dir = Path.GetDirectoryName(text) ?? "";
+                prefix = Path.GetFileName(text);
+            }
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return result;
+
+            foreach (var d in Directory.EnumerateDirectories(dir))
+            {
+                var name = Path.GetFileName(d);
+                if (prefix.Length == 0 || name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    result.Add(d);
+                if (result.Count >= 12) break;
+            }
+        }
+        catch { /* inaccessible path — just show nothing */ }
+        return result;
+    }
+
+    private void OnOpenFavorites(object sender, RoutedEventArgs e) => ShowFavorites();
+
+    // ---------- Keyboard ----------
+
+    private void OnListKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        var ctrl = (Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Control) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        var alt = (Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Menu) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        // Alt+Enter opens Properties. Handle it here (the list has focus and reliably
+        // gets this KeyDown) rather than relying on the RootGrid accelerator, which the
+        // focused ListView does not forward.
+        if (e.Key == VirtualKey.Enter && alt) { ShowPropertiesForSelection(); e.Handled = true; return; }
+        switch (e.Key)
+        {
+            case VirtualKey.Enter: ActivateItem(FileList.SelectedItem as FileItem); e.Handled = true; break;
+            case VirtualKey.Space: PreviewSelected(); e.Handled = true; break;
+            case VirtualKey.Back: OnUp(this, null!); e.Handled = true; break;
+            case VirtualKey.Delete: _ = ActionDeleteAsync(); e.Handled = true; break;
+            case VirtualKey.F2: _ = ActionRenameAsync(); e.Handled = true; break;
+            case VirtualKey.F5: RefreshCurrent(); e.Handled = true; break;
+            case VirtualKey.C when ctrl: _ = ActionClipboardAsync(cut: false); e.Handled = true; break;
+            case VirtualKey.X when ctrl: _ = ActionClipboardAsync(cut: true); e.Handled = true; break;
+            case VirtualKey.V when ctrl: _ = ActionPasteAsync(); e.Handled = true; break;
+        }
+    }
+
+    // Alt+Enter: properties of the selected item, or of the current folder if none selected.
+    private void ShowPropertiesForSelection()
+    {
+        if (FileList.SelectedItem is FileItem it && it.Kind is not ItemKind.UpDir and not ItemKind.Favorites)
+            _ = ShowPropertiesAsync(it);
+        else if (_view == View.Folder && _currentDir is not null)
+            _ = ShowPropertiesAsync(new FileItem { Name = new DirectoryInfo(_currentDir).Name, FullPath = _currentDir, Kind = ItemKind.Folder });
+    }
+
+    // ---------- Context menu ----------
+
+    private void OnListRightTapped(object sender, RightTappedRoutedEventArgs e)
+    {
+        var item = (e.OriginalSource as FrameworkElement)?.DataContext as FileItem;
+        var menu = new MenuFlyout();
+
+        if (item is not null && item.Kind != ItemKind.UpDir && item.Kind != ItemKind.Favorites)
+        {
+            if (!FileList.SelectedItems.Contains(item)) FileList.SelectedItem = item;
+            BuildItemMenu(menu, item);
+        }
+        else
+        {
+            BuildBackgroundMenu(menu);
+        }
+
+        if (menu.Items.Count > 0)
+            menu.ShowAt(FileList, new FlyoutShowOptions { Position = e.GetPosition(FileList) });
+    }
+
+    private void BuildItemMenu(MenuFlyout menu, FileItem item)
+    {
+        var selCount = FileList.SelectedItems.OfType<FileItem>().Count(i => i.Kind != ItemKind.UpDir);
+
+        menu.Items.Add(Mi("Open", 0xE8E5, (_, _) => ActivateItem(item), accel: "Enter"));
+
+        if (_view == View.Archive)
+        {
+            menu.Items.Add(Mi("Extract", 0xE8DE, (_, _) => OnExtract(this, null!)));
+            if (item.Kind is ItemKind.File or ItemKind.Archive)
+                menu.Items.Add(Mi("View", 0xE890, (_, _) => _ = ViewArchiveEntryAsync(item), accel: "Space"));
+            menu.Items.Add(new MenuFlyoutSeparator());
+            menu.Items.Add(Mi("Rename", 0xE8AC, (_, _) => _ = ActionRenameAsync(), enabled: selCount == 1, accel: "F2"));
+            menu.Items.Add(Mi("Delete from archive", 0xE74D, (_, _) => _ = ActionDeleteFromArchiveAsync(), accel: "Del"));
+            menu.Items.Add(new MenuFlyoutSeparator());
+            menu.Items.Add(Mi("Properties", 0xE946, (_, _) => _ = ShowPropertiesAsync(item), accel: "Alt+Enter"));
+            return;
+        }
+
+        if (_view == View.Favorites)
+        {
+            menu.Items.Add(Mi("Remove from Favorites", 0xE8D9, (_, _) => RemoveFavorite(item)));
+            menu.Items.Add(new MenuFlyoutSeparator());
+            menu.Items.Add(Mi("Properties", 0xE946, (_, _) => _ = ShowPropertiesAsync(item), accel: "Alt+Enter"));
+            return;
+        }
+
+        // Drive / Folder view
+        if (item.Kind == ItemKind.Archive)
+            menu.Items.Add(Mi("Extract", 0xE8DE, (_, _) => OnExtract(this, null!)));
+        if (item.Kind is ItemKind.File or ItemKind.Archive)
+            menu.Items.Add(Mi("View", 0xE890, (_, _) => _ = PreviewPathAsync(item.FullPath, item.Name), accel: "Space"));
+
+        if (item.Kind != ItemKind.Drive)
+        {
+            menu.Items.Add(Mi("Add to archive", 0xE710, (_, _) => OnCompress(this, null!)));
+            menu.Items.Add(new MenuFlyoutSeparator());
+            menu.Items.Add(Mi("Cut", 0xE8C6, (_, _) => _ = ActionClipboardAsync(cut: true), accel: "Ctrl+X"));
+            menu.Items.Add(Mi("Copy", 0xE8C8, (_, _) => _ = ActionClipboardAsync(cut: false), accel: "Ctrl+C"));
+            menu.Items.Add(Mi("Rename", 0xE8AC, (_, _) => _ = ActionRenameAsync(), enabled: selCount == 1, accel: "F2"));
+            menu.Items.Add(Mi("Delete", 0xE74D, (_, _) => _ = ActionDeleteAsync(), accel: "Del"));
+            menu.Items.Add(new MenuFlyoutSeparator());
+        }
+        menu.Items.Add(Mi("Add to Favorites", 0xE734, (_, _) => AddSelectedToFavorites()));
+        menu.Items.Add(new MenuFlyoutSeparator());
+        menu.Items.Add(Mi("Properties", 0xE946, (_, _) => _ = ShowPropertiesAsync(item), accel: "Alt+Enter"));
+    }
+
+    private void BuildBackgroundMenu(MenuFlyout menu)
+    {
+        if (_view == View.Folder && _currentDir is not null)
+        {
+            menu.Items.Add(Mi("New folder", 0xE8F4, (_, _) => _ = ActionNewFolderAsync()));
+            menu.Items.Add(Mi("New file", 0xE7C3, (_, _) => _ = ActionNewFileAsync()));
+            menu.Items.Add(Mi("Paste", 0xE77F, (_, _) => _ = ActionPasteAsync(), enabled: _clip.Count > 0 || ClipboardHasFiles(), accel: "Ctrl+V"));
+            menu.Items.Add(new MenuFlyoutSeparator());
+            menu.Items.Add(Mi("Refresh", 0xE72C, (_, _) => RefreshCurrent(), accel: "F5"));
+            menu.Items.Add(Mi("Add folder to Favorites", 0xE734, (_, _) => AddFavoritePath(_currentDir!)));
+            menu.Items.Add(new MenuFlyoutSeparator());
+            menu.Items.Add(Mi("Properties", 0xE946, (_, _) => _ = ShowPropertiesAsync(
+                new FileItem { Name = new DirectoryInfo(_currentDir).Name, FullPath = _currentDir, Kind = ItemKind.Folder })));
+        }
+        else
+        {
+            menu.Items.Add(Mi("Refresh", 0xE72C, (_, _) => RefreshCurrent()));
+            if (_view == View.Archive && _openArchive is not null)
+                menu.Items.Add(Mi("Archive properties", 0xE946, (_, _) => _ = ShowPropertiesAsync(
+                    new FileItem { Name = Path.GetFileName(_openArchive), FullPath = _openArchive, Kind = ItemKind.Archive })));
+        }
+    }
+
+    private static MenuFlyoutItem Mi(string text, int glyph, RoutedEventHandler onClick, bool enabled = true, string? accel = null)
+    {
+        var mi = new MenuFlyoutItem { Text = text, Icon = new FontIcon { Glyph = char.ConvertFromUtf32(glyph) }, IsEnabled = enabled };
+        if (accel is not null) mi.KeyboardAcceleratorTextOverride = accel;
+        mi.Click += onClick;
+        return mi;
+    }
+
+    // ---------- Extract / Compress ----------
+
+    // 7z reports wrong/absent passwords as a fatal error (code 2) mentioning the password.
+    private static bool IsPasswordError(Exception ex) =>
+        ex.Message.Contains("password", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("code 2)");
+
+    private async Task<string?> AskPasswordAsync()
+    {
+        var box = new PasswordBox { PlaceholderText = "Archive password" };
+        var dlg = new ContentDialog
+        {
+            Title = "Password required", Content = box,
+            PrimaryButtonText = "OK", CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary, XamlRoot = RootGrid.XamlRoot,
+        };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return null;
+        return string.IsNullOrEmpty(box.Password) ? null : box.Password;
+    }
+
+    // Extract, prompting for a password (and retrying until correct or cancelled) if the
+    // archive turns out to be encrypted. The working password is remembered.
+    private async Task ExtractWithPasswordAsync(string archive, string dest, IEnumerable<string>? only, string? initial,
+        IProgress<int>? progress = null, System.Threading.CancellationToken ct = default)
+    {
+        var pw = initial;
+        while (true)
+        {
+            try { await _engine.ExtractAsync(archive, dest, only, pw, progress, ct); return; }
+            catch (Exception ex) when (IsPasswordError(ex))
+            {
+                // Hide the overlay while the (modal) password dialog is up, then restore it.
+                bool wasVisible = ProgressOverlay.Visibility == Visibility.Visible;
+                if (wasVisible) ProgressOverlay.Visibility = Visibility.Collapsed;
+                pw = await AskPasswordAsync();
+                if (pw is null) throw new OperationCanceledException();
+                _archivePassword = pw;
+                if (wasVisible) ProgressOverlay.Visibility = Visibility.Visible;
+            }
+        }
+    }
+
+    private async void OnExtract(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            string archive;
+            IEnumerable<string>? only = null;
+            long totalBytes;
+            List<FileItem> archiveSel = new();
+
+            if (_view == View.Archive && _openArchive is not null)
+            {
+                archive = _openArchive;
+                archiveSel = FileList.SelectedItems.OfType<FileItem>().Where(i => i.Kind != ItemKind.UpDir).ToList();
+                if (archiveSel.Count > 0)
+                    only = archiveSel.Select(i => i.Kind == ItemKind.Folder ? i.FullPath + "\\*" : i.FullPath).ToList();
+                totalBytes = ArchiveSelectionSize(archiveSel);
+            }
+            else
+            {
+                if (FileList.SelectedItem is not FileItem fi || fi.Kind != ItemKind.Archive)
+                {
+                    await ShowError("Nothing to extract", "Select an archive.");
+                    return;
+                }
+                archive = fi.FullPath;
+                totalBytes = 0; // resolved after we know the password (below)
+            }
+
+            // Ask where to extract instead of silently dropping next to the archive.
+            var dest = await PickFolderAsync();
+            if (dest is null) return; // cancelled the picker
+
+            // For a standalone archive we can now read its total weight for the size
+            // read-out (best effort — an encrypted listing simply leaves it unknown).
+            if (_view != View.Archive)
+            {
+                try
+                {
+                    var entries = await _engine.ListAsync(archive, null);
+                    totalBytes = entries.Where(en => !en.IsDirectory).Sum(en => en.Size);
+                }
+                catch { totalBytes = 0; }
+            }
+
+            var (progress, token) = BeginProgress("Extracting…", totalBytes);
+            await ExtractWithPasswordAsync(archive, dest, only, _view == View.Archive ? _archivePassword : null, progress, token);
+            EndProgress();
+            await ShowInfo("Done", $"Extracted to:\n{dest}");
+        }
+        catch (OperationCanceledException) { EndProgress(); }
+        catch (Exception ex)
+        {
+            EndProgress();
+            await ShowError("Extraction error", ex.Message);
+        }
+    }
+
+    // Uncompressed weight of a selection inside the open archive (empty selection = whole archive).
+    private long ArchiveSelectionSize(IReadOnlyList<FileItem> sel)
+    {
+        if (_archiveEntries.Count == 0) return 0;
+        if (sel.Count == 0) return _archiveEntries.Where(en => !en.IsDirectory).Sum(en => en.Size);
+
+        long total = 0;
+        foreach (var i in sel)
+        {
+            if (i.Kind == ItemKind.Folder)
+            {
+                var prefix = i.FullPath + "\\";
+                total += _archiveEntries.Where(en => !en.IsDirectory && en.Path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).Sum(en => en.Size);
+            }
+            else
+            {
+                var match = _archiveEntries.FirstOrDefault(en => string.Equals(en.Path, i.FullPath, StringComparison.OrdinalIgnoreCase));
+                if (match is not null) total += match.Size;
+            }
+        }
+        return total;
+    }
+
+    // Shows the system folder picker; returns null if cancelled.
+    private async Task<string?> PickFolderAsync()
+    {
+        var picker = new Windows.Storage.Pickers.FolderPicker
+        {
+            SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.ComputerFolder,
+        };
+        picker.FileTypeFilter.Add("*");
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
+        var folder = await picker.PickSingleFolderAsync();
+        return folder?.Path;
+    }
+
+    private async void OnCompress(object sender, RoutedEventArgs e)
+    {
+        if (_view != View.Folder || _currentDir is null) return;
+        var sources = FileList.SelectedItems.OfType<FileItem>()
+            .Where(i => i.Kind != ItemKind.UpDir).Select(i => i.FullPath).ToList();
+        if (sources.Count == 0) { await ShowError("Nothing to compress", "Select files or folders."); return; }
+
+        var defaultName = sources.Count == 1
+            ? Path.GetFileNameWithoutExtension(sources[0]) is var n && n.Length > 0 ? n : Path.GetFileName(sources[0])
+            : new DirectoryInfo(_currentDir).Name;
+
+        var opts = await AskCompressOptionsAsync(defaultName, _currentDir);
+        if (opts is null) return;
+
+        var (name, format, level, password, destDir) = opts.Value;
+        var archivePath = Path.Combine(destDir, $"{name}.{format}");
+
+        try
+        {
+            Directory.CreateDirectory(destDir);
+            var (progress, token) = BeginProgress("Compressing…", TotalPathsSize(sources));
+            await _engine.CreateAsync(archivePath, sources, format, level, password, progress, token);
+            _settings.DefaultFormat = format; _settings.DefaultLevel = level; _settings.Save();
+            EndProgress();
+            if (string.Equals(destDir.TrimEnd('\\'), _currentDir.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                NavigateToFolder(_currentDir, pushHistory: false);
+            await ShowInfo("Done", $"Archive created:\n{archivePath}");
+        }
+        catch (OperationCanceledException) { EndProgress(); }
+        catch (Exception ex)
+        {
+            EndProgress();
+            await ShowError("Compression error", ex.Message);
+        }
+    }
+
+    private async Task<(string name, string format, int level, string? password, string destDir)?> AskCompressOptionsAsync(string defaultName, string defaultDir)
+    {
+        var nameBox = new TextBox { Text = defaultName, Header = "Archive name" };
+        var formatBox = new ComboBox { Header = "Format", HorizontalAlignment = HorizontalAlignment.Stretch };
+        formatBox.Items.Add("7z"); formatBox.Items.Add("zip");
+        formatBox.SelectedIndex = _settings.DefaultFormat == "zip" ? 1 : 0;
+        var levels = new (string label, int value)[]
+        {
+            ("Store", 0), ("Fast", 1), ("Normal", 5), ("Maximum", 7), ("Ultra", 9)
+        };
+        var levelBox = new ComboBox { Header = "Compression level", HorizontalAlignment = HorizontalAlignment.Stretch };
+        foreach (var l in levels) levelBox.Items.Add(l.label);
+        levelBox.SelectedIndex = Math.Max(0, Array.FindIndex(levels, l => l.value == _settings.DefaultLevel));
+        if (levelBox.SelectedIndex < 0) levelBox.SelectedIndex = 2;
+        var passBox = new PasswordBox { Header = "Password (optional)" };
+
+        // Destination folder: typed path + "Browse…" folder picker.
+        var destBox = new TextBox { Text = defaultDir, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var browseBtn = new Button { Content = "Browse…", VerticalAlignment = VerticalAlignment.Bottom };
+        browseBtn.Click += async (_, _) =>
+        {
+            var picker = new Windows.Storage.Pickers.FolderPicker { SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.ComputerFolder };
+            picker.FileTypeFilter.Add("*");
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
+            var folder = await picker.PickSingleFolderAsync();
+            if (folder is not null) destBox.Text = folder.Path;
+        };
+        var destRow = new Grid { ColumnSpacing = 8 };
+        destRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        destRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(destBox, 0); Grid.SetColumn(browseBtn, 1);
+        destRow.Children.Add(destBox); destRow.Children.Add(browseBtn);
+        var destPanel = new StackPanel { Spacing = 4 };
+        destPanel.Children.Add(new TextBlock { Text = "Save to", Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"] });
+        destPanel.Children.Add(destRow);
+
+        var panel = new StackPanel { Spacing = 12, MinWidth = 360 };
+        panel.Children.Add(nameBox); panel.Children.Add(formatBox);
+        panel.Children.Add(levelBox); panel.Children.Add(passBox); panel.Children.Add(destPanel);
+
+        var dlg = new ContentDialog
+        {
+            Title = "Create archive", Content = new ScrollViewer { Content = panel },
+            PrimaryButtonText = "Create", CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary, XamlRoot = RootGrid.XamlRoot,
+        };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return null;
+
+        var name = string.IsNullOrWhiteSpace(nameBox.Text) ? defaultName : nameBox.Text.Trim();
+        var format = (string)formatBox.SelectedItem;
+        var level = levels[levelBox.SelectedIndex].value;
+        var password = string.IsNullOrEmpty(passBox.Password) ? null : passBox.Password;
+        var destDir = string.IsNullOrWhiteSpace(destBox.Text) ? defaultDir : destBox.Text.Trim().Trim('"');
+        return (name, format, level, password, destDir);
+    }
+
+    // ---------- File operations ----------
+
+    private async Task ActionRenameAsync()
+    {
+        if (FileList.SelectedItem is not FileItem item || item.Kind == ItemKind.UpDir) return;
+
+        var box = new TextBox { Text = item.Name, SelectionStart = 0, SelectionLength = item.Name.Length };
+        var dlg = new ContentDialog
+        {
+            Title = "Rename", Content = box,
+            PrimaryButtonText = "OK", CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary, XamlRoot = RootGrid.XamlRoot,
+        };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+        var newName = box.Text.Trim();
+        if (string.IsNullOrEmpty(newName) || newName == item.Name) return;
+
+        try
+        {
+            if (_view == View.Archive && _openArchive is not null)
+            {
+                var newInternal = _archiveSubPath + newName;
+                SetBusy(true);
+                await _engine.RenameEntryAsync(_openArchive, item.FullPath, newInternal);
+                await ReloadArchiveAsync();
+                SetBusy(false);
+            }
+            else
+            {
+                var dir = Path.GetDirectoryName(item.FullPath)!;
+                var target = Path.Combine(dir, newName);
+                if (Directory.Exists(item.FullPath)) Directory.Move(item.FullPath, target);
+                else File.Move(item.FullPath, target);
+                if (_currentDir is not null) NavigateToFolder(_currentDir, pushHistory: false);
+            }
+        }
+        catch (Exception ex) { SetBusy(false); await ShowError("Could not rename", ex.Message); }
+    }
+
+    private async Task ActionDeleteAsync()
+    {
+        var sel = FileList.SelectedItems.OfType<FileItem>()
+            .Where(i => i.Kind is not ItemKind.UpDir and not ItemKind.Drive and not ItemKind.Favorites)
+            .Select(i => i.FullPath).ToList();
+        if (sel.Count == 0) return;
+
+        if (_settings.ConfirmDelete)
+        {
+            var text = sel.Count == 1 ? $"Move to the Recycle Bin:\n{sel[0]}?" : $"Move {sel.Count} items to the Recycle Bin?";
+            if (!await Confirm("Delete", text)) return;
+        }
+        try
+        {
+            await Task.Run(() => ShellOps.RecycleDelete(sel));
+            if (_currentDir is not null) NavigateToFolder(_currentDir, pushHistory: false);
+        }
+        catch (Exception ex) { await ShowError("Could not delete", ex.Message); }
+    }
+
+    private async Task ActionDeleteFromArchiveAsync()
+    {
+        if (_openArchive is null) return;
+        var sel = FileList.SelectedItems.OfType<FileItem>().Where(i => i.Kind != ItemKind.UpDir)
+            .Select(i => i.Kind == ItemKind.Folder ? i.FullPath + "\\*" : i.FullPath).ToList();
+        if (sel.Count == 0) return;
+        if (!await Confirm("Delete from archive", $"Delete {sel.Count} items from the archive?")) return;
+        try
+        {
+            SetBusy(true);
+            await _engine.DeleteEntriesAsync(_openArchive, sel);
+            await ReloadArchiveAsync();
+            SetBusy(false);
+        }
+        catch (Exception ex) { SetBusy(false); await ShowError("Could not delete from the archive", ex.Message); }
+    }
+
+    private async Task ActionNewFolderAsync()
+    {
+        if (_currentDir is null) return;
+        var box = new TextBox { Text = "New folder" };
+        var dlg = new ContentDialog { Title = "New folder", Content = box, PrimaryButtonText = "Create", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Primary, XamlRoot = RootGrid.XamlRoot };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+        try { Directory.CreateDirectory(Path.Combine(_currentDir, box.Text.Trim())); NavigateToFolder(_currentDir, false); }
+        catch (Exception ex) { await ShowError("Could not create the folder", ex.Message); }
+    }
+
+    private async Task ActionNewFileAsync()
+    {
+        if (_currentDir is null) return;
+        var box = new TextBox { Text = "New file.txt" };
+        var dlg = new ContentDialog { Title = "New file", Content = box, PrimaryButtonText = "Create", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Primary, XamlRoot = RootGrid.XamlRoot };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+        try
+        {
+            var path = Path.Combine(_currentDir, box.Text.Trim());
+            if (!File.Exists(path)) File.Create(path).Dispose();
+            NavigateToFolder(_currentDir, false);
+        }
+        catch (Exception ex) { await ShowError("Could not create the file", ex.Message); }
+    }
+
+    // ---------- Clipboard ----------
+
+    private async Task ActionClipboardAsync(bool cut)
+    {
+        var sel = FileList.SelectedItems.OfType<FileItem>()
+            .Where(i => i.Kind is not ItemKind.UpDir and not ItemKind.Drive and not ItemKind.Favorites)
+            .Select(i => i.FullPath).Where(p => File.Exists(p) || Directory.Exists(p)).ToList();
+        if (sel.Count == 0) return;
+        _clip = sel; _clipCut = cut;
+
+        try
+        {
+            var items = new List<IStorageItem>();
+            foreach (var p in sel)
+            {
+                if (Directory.Exists(p)) items.Add(await StorageFolder.GetFolderFromPathAsync(p));
+                else items.Add(await StorageFile.GetFileFromPathAsync(p));
+            }
+            var dp = new DataPackage { RequestedOperation = cut ? DataPackageOperation.Move : DataPackageOperation.Copy };
+            dp.SetStorageItems(items);
+            Clipboard.SetContent(dp);
+        }
+        catch { /* internal _clip still works even if the system clipboard refuses */ }
+        SetStatus($"{(cut ? "Cut" : "Copied")}: {sel.Count}");
+    }
+
+    private static bool ClipboardHasFiles()
+    {
+        try { return Clipboard.GetContent().Contains(StandardDataFormats.StorageItems); }
+        catch { return false; }
+    }
+
+    private async Task ActionPasteAsync()
+    {
+        if (_view != View.Folder || _currentDir is null) return;
+        try
+        {
+            List<string> paths;
+            bool move;
+            if (_clip.Count > 0) { paths = _clip; move = _clipCut; }
+            else
+            {
+                var view = Clipboard.GetContent();
+                if (!view.Contains(StandardDataFormats.StorageItems)) return;
+                var items = await view.GetStorageItemsAsync();
+                paths = items.Select(i => i.Path).Where(p => !string.IsNullOrEmpty(p)).ToList();
+                move = false;
+            }
+            if (paths.Count == 0) return;
+
+            var dest = _currentDir;
+            SetBusy(true);
+            await Task.Run(() =>
+            {
+                foreach (var p in paths)
+                {
+                    if (move) ShellOps.MoveInto(p, dest);
+                    else ShellOps.CopyInto(p, dest);
+                }
+            });
+            SetBusy(false);
+            if (_clipCut) { _clip = new(); _clipCut = false; }
+            NavigateToFolder(dest, pushHistory: false);
+        }
+        catch (Exception ex) { SetBusy(false); await ShowError("Could not paste", ex.Message); }
+    }
+
+    // ---------- Favorites ----------
+
+    private void AddSelectedToFavorites()
+    {
+        foreach (var i in FileList.SelectedItems.OfType<FileItem>()
+                     .Where(i => i.Kind is ItemKind.Folder or ItemKind.File or ItemKind.Archive))
+            AddFavoritePath(i.FullPath);
+    }
+
+    private void AddFavoritePath(string path)
+    {
+        if (_settings.Favorites.Any(f => string.Equals(f.Path, path, StringComparison.OrdinalIgnoreCase))) return;
+        ItemKind kind = Directory.Exists(path) ? ItemKind.Folder : IsArchive(path) ? ItemKind.Archive : ItemKind.File;
+        _settings.Favorites.Add(new FavoriteEntry { Name = Path.GetFileName(path.TrimEnd('\\')) is { Length: > 0 } n ? n : path, Path = path, Kind = kind });
+        _settings.Save();
+        if (_view == View.Favorites) ShowFavorites(pushHistory: false);
+        SetTransientStatus("Added to Favorites");
+    }
+
+    private void RemoveFavorite(FileItem item)
+    {
+        _settings.Favorites.RemoveAll(f => string.Equals(f.Path, item.FullPath, StringComparison.OrdinalIgnoreCase));
+        _settings.Save();
+        ShowFavorites(pushHistory: false);
+    }
+
+    // ---------- Drag & drop ----------
+
+    // Drag files/folders (or archive entries) out of the app. Initiated at element
+    // level on the row's icon+name panel (not the ListView's row-level drag): that
+    // panel sizes to its content, so the framework's drag snapshot is a small
+    // Explorer-style icon+label instead of a full-width row bar. DragStartingEventArgs
+    // (unlike DragItemsStartingEventArgs) also exposes DragUI and a real deferral, so
+    // archive entries can be extracted before the drop rather than via unreliable
+    // delayed rendering.
+    private void OnItemDragStarting(UIElement sender, DragStartingEventArgs args)
+    {
+        if (sender is not FrameworkElement fe || fe.DataContext is not FileItem clicked) { args.Cancel = true; return; }
+
+        // Drag the whole selection when the grabbed row is part of it — check both the
+        // live selection and the snapshot taken on pointer-press, since the ListView can
+        // collapse a multi-selection to the pressed row before the drag begins.
+        var current = FileList.SelectedItems.OfType<FileItem>().ToList();
+        var baseSel = current.Contains(clicked) ? current
+                    : _dragSnapshot.Contains(clicked) ? _dragSnapshot
+                    : new List<FileItem> { clicked };
+        var sel = baseSel
+            .Where(i => i.Kind is not ItemKind.UpDir and not ItemKind.Drive and not ItemKind.Favorites and not ItemKind.Header)
+            .ToList();
+        DragLog($"DragStarting view={_view} sel={sel.Count} first={sel.FirstOrDefault()?.Name}");
+        if (sel.Count == 0 || _view is View.Drives) { args.Cancel = true; return; }
+
+        // Archive drags are handled natively before StartDragAsync is ever called
+        // (StartArchiveDrag), so WinUI should never raise DragStarting in Archive view.
+        if (_view == View.Archive) { args.Cancel = true; return; }
+
+        args.Data.RequestedOperation = DataPackageOperation.Copy;
+
+        {
+            var list = new List<IStorageItem>();
+            // Resolve each item independently: a single unreadable entry (e.g. a
+            // shortcut the broker refuses) must not drop the rest of the selection.
+            foreach (var i in sel)
+            {
+                try
+                {
+                    if (Directory.Exists(i.FullPath))
+                        list.Add(StorageFolder.GetFolderFromPathAsync(i.FullPath).AsTask().GetAwaiter().GetResult());
+                    else if (File.Exists(i.FullPath))
+                        list.Add(StorageFile.GetFileFromPathAsync(i.FullPath).AsTask().GetAwaiter().GetResult());
+                }
+                catch { /* this item is skipped; others still drag */ }
+            }
+            if (list.Count > 0) args.Data.SetStorageItems(list, readOnly: false);
+            else args.Cancel = true;
+        }
+    }
+
+    // Lightweight drag diagnostics: appends to %TEMP%\FluentZip_drag.log so a failed drag
+    // can be diagnosed from a real machine (drag-drop can't be exercised by automation).
+    private static void DragLog(string msg)
+    {
+        try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "FluentZip_drag.log"),
+            $"{DateTime.Now:HH:mm:ss.fff} {msg}{Environment.NewLine}"); }
+        catch { /* logging must never break a drag */ }
+    }
+
+    // Native virtual-file drag for Archive view: builds one ShellDrag.Entry per file
+    // (folders are flattened to their descendant files) with a lazy extractor, then runs
+    // the OLE drag. Extraction happens when the drop target reads each file, so the drag
+    // starts instantly even for multi-GB entries.
+    private void StartArchiveDrag(FileItem clicked)
+    {
+        if (_openArchive is null) return;
+
+        var current = FileList.SelectedItems.OfType<FileItem>().ToList();
+        var baseSel = current.Contains(clicked) ? current
+                    : _dragSnapshot.Contains(clicked) ? _dragSnapshot
+                    : new List<FileItem> { clicked };
+        var sel = baseSel.Where(i => i.Kind is not ItemKind.UpDir and not ItemKind.Header).ToList();
+        if (sel.Count == 0) return;
+
+        var archive = _openArchive;
+        var pw = _archivePassword;
+        var subPrefix = _archiveSubPath ?? "";
+        var baseTemp = Path.Combine(Path.GetTempPath(), "FluentZip_drag", Guid.NewGuid().ToString("N"));
+
+        var files = new List<ShellDrag.Entry>();
+        foreach (var i in sel)
+        {
+            if (i.Kind == ItemKind.Folder)
+            {
+                var folderPrefix = i.FullPath.TrimEnd('\\') + "\\";
+                foreach (var entry in _archiveEntries)
+                {
+                    if (entry.IsDirectory) continue;
+                    var ep = entry.Path.Replace('/', '\\');
+                    if (!ep.StartsWith(folderPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                    AddArchiveDragFile(files, archive, pw, baseTemp, subPrefix, ep, entry.Size);
+                }
+            }
+            else
+            {
+                AddArchiveDragFile(files, archive, pw, baseTemp, subPrefix, i.FullPath, i.Size);
+            }
+        }
+
+        DragLog($"native archive drag files={files.Count} first={(files.Count > 0 ? files[0].RelativeName : "<none>")}");
+        if (files.Count == 0) return;
+        try { ShellDrag.DoDrag(files); }
+        catch (Exception ex) { DragLog("native archive drag failed: " + ex); }
+    }
+
+    private void AddArchiveDragFile(List<ShellDrag.Entry> files, string archive, string? pw,
+        string baseTemp, string subPrefix, string inArchivePath, long size)
+    {
+        string rel = inArchivePath;
+        if (subPrefix.Length > 0 && rel.StartsWith(subPrefix, StringComparison.OrdinalIgnoreCase))
+            rel = rel.Substring(subPrefix.Length);
+
+        files.Add(new ShellDrag.Entry
+        {
+            RelativeName = rel,
+            Size = size,
+            // Extracts this one entry to temp (on the thread pool to avoid blocking the
+            // UI thread's own async continuation), returns the written file's path.
+            Extract = () =>
+            {
+                Task.Run(() => _engine.ExtractAsync(archive, baseTemp, new[] { inArchivePath }, pw))
+                    .GetAwaiter().GetResult();
+                return Path.Combine(baseTemp, inArchivePath);
+            },
+        });
+    }
+
+    private void OnListDragOver(object sender, DragEventArgs e)
+    {
+        bool canDrop = e.DataView.Contains(StandardDataFormats.StorageItems)
+                       && _view is View.Folder or View.Archive or View.Favorites;
+        if (canDrop)
+        {
+            e.AcceptedOperation = DataPackageOperation.Copy;
+            e.DragUIOverride.IsCaptionVisible = true;
+            e.DragUIOverride.Caption = _view switch
+            {
+                View.Archive => "Add to archive",
+                View.Favorites => "Add to Favorites",
+                _ => "Copy here",
+            };
+        }
+        else e.AcceptedOperation = DataPackageOperation.None;
+    }
+
+    private async void OnListDrop(object sender, DragEventArgs e)
+    {
+        if (!e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+        var def = e.GetDeferral();
+        try
+        {
+            var items = await e.DataView.GetStorageItemsAsync();
+            var paths = items.Select(i => i.Path).Where(p => !string.IsNullOrEmpty(p)).ToList();
+            if (paths.Count == 0) return;
+
+            if (_view == View.Archive && _openArchive is not null)
+            {
+                var (progress, token) = BeginProgress("Adding to archive…", TotalPathsSize(paths));
+                await _engine.AddAsync(_openArchive, paths, progress, token);
+                await ReloadArchiveAsync();
+                EndProgress();
+            }
+            else if (_view == View.Folder && _currentDir is not null)
+            {
+                var dest = _currentDir;
+                // Dropping items back onto the folder they already live in (e.g. you
+                // start a drag then release over the same list to cancel) must not
+                // duplicate them — skip anything already inside dest.
+                var incoming = paths.Where(p =>
+                    !string.Equals(Path.GetDirectoryName(p.TrimEnd('\\')), dest.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (incoming.Count == 0) return;
+                SetBusy(true);
+                await Task.Run(() => { foreach (var p in incoming) ShellOps.CopyInto(p, dest); });
+                SetBusy(false);
+                NavigateToFolder(dest, pushHistory: false);
+            }
+            else if (_view == View.Favorites)
+            {
+                foreach (var p in paths) AddFavoritePath(p);
+            }
+        }
+        catch (OperationCanceledException) { EndProgress(); }
+        catch (Exception ex) { SetBusy(false); EndProgress(); await ShowError("Could not accept the drop", ex.Message); }
+        finally { def.Complete(); }
+    }
+
+    // ---------- View archive entry ----------
+
+    private async Task ViewArchiveEntryAsync(FileItem item)
+    {
+        if (_openArchive is null) return;
+        if (item.Kind == ItemKind.Archive) { await OpenArchiveNestedAsync(item); return; }
+        try
+        {
+            var temp = Path.Combine(Path.GetTempPath(), "FluentZip_view", Guid.NewGuid().ToString("N"));
+            SetBusy(true);
+            await ExtractWithPasswordAsync(_openArchive, temp, new[] { item.FullPath }, _archivePassword);
+            SetBusy(false);
+            var outPath = Path.Combine(temp, item.FullPath);
+            if (File.Exists(outPath)) await PreviewPathAsync(outPath, item.Name);
+        }
+        catch (OperationCanceledException) { SetBusy(false); }
+        catch (Exception ex) { SetBusy(false); await ShowError("Could not open the file", ex.Message); }
+    }
+
+    private async Task OpenArchiveNestedAsync(FileItem item)
+    {
+        if (_openArchive is null) return;
+        try
+        {
+            var temp = Path.Combine(Path.GetTempPath(), "FluentZip_view", Guid.NewGuid().ToString("N"));
+            SetBusy(true);
+            await ExtractWithPasswordAsync(_openArchive, temp, new[] { item.FullPath }, _archivePassword);
+            SetBusy(false);
+            var outPath = Path.Combine(temp, item.FullPath);
+            if (File.Exists(outPath)) await OpenArchiveAsync(outPath);
+        }
+        catch (OperationCanceledException) { SetBusy(false); }
+        catch (Exception ex) { SetBusy(false); await ShowError("Could not open the archive", ex.Message); }
+    }
+
+    // ---------- In-app preview ----------
+
+    private void PreviewSelected()
+    {
+        if (FileList.SelectedItem is not FileItem item) return;
+        if (item.Kind is ItemKind.UpDir or ItemKind.Drive or ItemKind.Favorites) return;
+        if (_view == View.Archive)
+        {
+            if (item.Kind is ItemKind.File or ItemKind.Archive) _ = ViewArchiveEntryAsync(item);
+        }
+        else if (item.Kind is ItemKind.File or ItemKind.Archive)
+            _ = PreviewPathAsync(item.FullPath, item.Name);
+    }
+
+    private static readonly HashSet<string> ImageExts = new(StringComparer.OrdinalIgnoreCase)
+    { ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff" };
+
+    private static readonly HashSet<string> VideoExts = new(StringComparer.OrdinalIgnoreCase)
+    { ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv" };
+
+    private static readonly HashSet<string> AudioExts = new(StringComparer.OrdinalIgnoreCase)
+    { ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus" };
+
+    private static readonly HashSet<string> TextExts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".txt", ".md", ".log", ".json", ".xml", ".csv", ".ini", ".cfg", ".conf", ".yml", ".yaml",
+        ".cs", ".js", ".ts", ".jsx", ".tsx", ".html", ".htm", ".css", ".py", ".c", ".cpp", ".cc",
+        ".h", ".hpp", ".java", ".go", ".rs", ".sql", ".bat", ".cmd", ".ps1", ".sh", ".gitignore",
+        ".toml", ".env", ".properties", ".gradle", ".rb", ".php", ".lua", ".r", ".m", ".vb", ".xaml"
+    };
+
+    /// <summary>Preview a file on disk inside the app when the format is simple,
+    /// otherwise hand it off to the shell.</summary>
+    private async Task PreviewPathAsync(string path, string displayName)
+    {
+        var ext = Path.GetExtension(path);
+        try
+        {
+            if (VideoExts.Contains(ext) || AudioExts.Contains(ext))
+            {
+                bool isAudio = AudioExts.Contains(ext);
+                var mpe = new MediaPlayerElement
+                {
+                    AutoPlay = true, AreTransportControlsEnabled = true,
+                    Source = Windows.Media.Core.MediaSource.CreateFromUri(new Uri(path)),
+                    Width = isAudio ? 560 : 720,
+                    Height = isAudio ? 160 : 440,
+                    HorizontalAlignment = HorizontalAlignment.Stretch,
+                    VerticalAlignment = VerticalAlignment.Center,
+                };
+                var dlg = new ContentDialog
+                {
+                    Title = displayName, Content = mpe, CloseButtonText = "Close", XamlRoot = RootGrid.XamlRoot,
+                };
+                dlg.Resources["ContentDialogMaxWidth"] = 900.0;
+                dlg.Closed += (_, _) => mpe.MediaPlayer?.Pause();
+                await dlg.ShowAsync();
+                return;
+            }
+            if (ImageExts.Contains(ext))
+            {
+                var img = new Image { Stretch = Stretch.Uniform, MaxWidth = 720, MaxHeight = 520 };
+                var bmp = new Microsoft.UI.Xaml.Media.Imaging.BitmapImage();
+                using (var s = File.OpenRead(path))
+                    await bmp.SetSourceAsync(s.AsRandomAccessStream());
+                img.Source = bmp;
+                await ShowContentDialog(displayName, img, wide: true);
+                return;
+            }
+            if (TextExts.Contains(ext) || new FileInfo(path).Length <= 256 * 1024)
+            {
+                const int maxLines = 100;
+                var lines = new List<string>();
+                bool more = false;
+                using (var reader = new StreamReader(path, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+                {
+                    string? line;
+                    while ((line = await reader.ReadLineAsync()) is not null)
+                    {
+                        if (lines.Count >= maxLines) { more = true; break; }
+                        lines.Add(line);
+                    }
+                }
+                var text = string.Join(Environment.NewLine, lines);
+                if (more) text += Environment.NewLine + "…";
+                // AcceptsReturn MUST be set before Text: a single-line TextBox
+                // truncates an assigned value at the first line break, so setting
+                // Text first would keep only line 1 (this was the "one line" bug).
+                var tb = new TextBox
+                {
+                    AcceptsReturn = true, IsReadOnly = true, TextWrapping = TextWrapping.NoWrap,
+                    FontFamily = new FontFamily("Consolas"),
+                    Height = 480, MinWidth = 640,
+                    Text = text,
+                };
+                await ShowContentDialog(displayName, new ScrollViewer
+                {
+                    Content = tb, HorizontalScrollMode = ScrollMode.Auto,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                }, wide: true);
+                return;
+            }
+        }
+        catch (Exception ex) { await ShowError("Could not show the preview", ex.Message); return; }
+
+        LaunchPath(path); // unknown/binary format → open with the default app
+    }
+
+    private async Task ShowContentDialog(string title, UIElement content, bool wide = false)
+    {
+        var dlg = new ContentDialog
+        {
+            Title = title, Content = content, CloseButtonText = "Close", XamlRoot = RootGrid.XamlRoot,
+        };
+        if (wide) dlg.Resources["ContentDialogMaxWidth"] = 900.0;
+        await dlg.ShowAsync();
+    }
+
+    // ---------- Properties ----------
+
+    private async Task ShowPropertiesAsync(FileItem item)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Name: {item.Name}");
+        sb.AppendLine($"Path: {item.FullPath}");
+        sb.AppendLine($"Type: {KindLabel(item.Kind)}");
+
+        try
+        {
+            if (_view == View.Archive)
+            {
+                sb.AppendLine($"Size: {FileItem.FormatSize(item.Size)}");
+                if (item.Modified is not null) sb.AppendLine($"Modified: {item.ModifiedText}");
+            }
+            else if (item.Kind == ItemKind.Archive && File.Exists(item.FullPath))
+            {
+                var fi = new FileInfo(item.FullPath);
+                sb.AppendLine($"Archive size: {FileItem.FormatSize(fi.Length)}");
+                sb.AppendLine($"Modified: {fi.LastWriteTime:yyyy-MM-dd HH:mm}");
+                var entries = await _engine.ListAsync(item.FullPath);
+                long total = entries.Where(e => !e.IsDirectory).Sum(e => e.Size);
+                sb.AppendLine($"Files inside: {entries.Count(e => !e.IsDirectory)}");
+                sb.AppendLine($"Unpacked size: {FileItem.FormatSize(total)}");
+                if (fi.Length > 0) sb.AppendLine($"Compression ratio: {(int)(100 - fi.Length * 100.0 / Math.Max(1, total))}%");
+            }
+            else if (Directory.Exists(item.FullPath))
+            {
+                var di = new DirectoryInfo(item.FullPath);
+                sb.AppendLine($"Modified: {di.LastWriteTime:yyyy-MM-dd HH:mm}");
+                try
+                {
+                    sb.AppendLine($"Subfolders: {di.EnumerateDirectories().Count()}");
+                    sb.AppendLine($"Files: {di.EnumerateFiles().Count()}");
+                }
+                catch { }
+            }
+            else if (File.Exists(item.FullPath))
+            {
+                var fi = new FileInfo(item.FullPath);
+                sb.AppendLine($"Size: {FileItem.FormatSize(fi.Length)}");
+                sb.AppendLine($"Modified: {fi.LastWriteTime:yyyy-MM-dd HH:mm}");
+                sb.AppendLine($"Created: {fi.CreationTime:yyyy-MM-dd HH:mm}");
+                sb.AppendLine($"Attributes: {fi.Attributes}");
+            }
+        }
+        catch (Exception ex) { sb.AppendLine($"(Could not read details: {ex.Message})"); }
+
+        await ShowDialog("Properties", sb.ToString());
+    }
+
+    private static string KindLabel(ItemKind k) => k switch
+    {
+        ItemKind.Drive => "Drive", ItemKind.Folder => "Folder", ItemKind.Archive => "Archive",
+        ItemKind.File => "File", _ => "Item",
+    };
+
+    // ---------- Settings / About ----------
+
+    private async void OnOpenSettings(object sender, RoutedEventArgs e)
+    {
+        var themeBox = new ComboBox { Header = "Theme", HorizontalAlignment = HorizontalAlignment.Stretch };
+        themeBox.Items.Add("System"); themeBox.Items.Add("Light"); themeBox.Items.Add("Dark");
+        themeBox.SelectedIndex = _settings.Theme switch { "Light" => 1, "Dark" => 2, _ => 0 };
+
+        var formatBox = new ComboBox { Header = "Default format", HorizontalAlignment = HorizontalAlignment.Stretch };
+        formatBox.Items.Add("7z"); formatBox.Items.Add("zip");
+        formatBox.SelectedIndex = _settings.DefaultFormat == "zip" ? 1 : 0;
+
+        var levels = new (string label, int value)[] { ("Store", 0), ("Fast", 1), ("Normal", 5), ("Maximum", 7), ("Ultra", 9) };
+        var levelBox = new ComboBox { Header = "Default compression level", HorizontalAlignment = HorizontalAlignment.Stretch };
+        foreach (var l in levels) levelBox.Items.Add(l.label);
+        levelBox.SelectedIndex = Math.Max(0, Array.FindIndex(levels, l => l.value == _settings.DefaultLevel));
+
+        var hiddenSwitch = new ToggleSwitch { Header = "Show hidden and system files", IsOn = _settings.ShowHidden };
+        var confirmSwitch = new ToggleSwitch { Header = "Confirm before deleting", IsOn = _settings.ConfirmDelete };
+
+        bool openAbout = false;
+        var aboutBtn = new Button { Content = "About FluentZip", HorizontalAlignment = HorizontalAlignment.Stretch };
+
+        var panel = new StackPanel { Spacing = 12, MinWidth = 340 };
+        panel.Children.Add(themeBox); panel.Children.Add(formatBox); panel.Children.Add(levelBox);
+        panel.Children.Add(hiddenSwitch); panel.Children.Add(confirmSwitch);
+        panel.Children.Add(new Border { Height = 1, Background = (Brush)Application.Current.Resources["CardStrokeColorDefaultBrush"], Margin = new Thickness(0, 4, 0, 4) });
+        panel.Children.Add(aboutBtn);
+
+        var dlg = new ContentDialog
+        {
+            Title = "Settings", Content = new ScrollViewer { Content = panel },
+            PrimaryButtonText = "Save", CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary, XamlRoot = RootGrid.XamlRoot,
+        };
+        aboutBtn.Click += (_, _) => { openAbout = true; dlg.Hide(); };
+
+        var result = await dlg.ShowAsync();
+        if (openAbout) { await ShowAboutAsync(); return; }
+        if (result != ContentDialogResult.Primary) return;
+
+        _settings.Theme = themeBox.SelectedIndex switch { 1 => "Light", 2 => "Dark", _ => "Default" };
+        _settings.DefaultFormat = (string)formatBox.SelectedItem;
+        _settings.DefaultLevel = levels[levelBox.SelectedIndex].value;
+        _settings.ShowHidden = hiddenSwitch.IsOn;
+        _settings.ConfirmDelete = confirmSwitch.IsOn;
+        _settings.Save();
+
+        ApplyTheme(ParseTheme(_settings.Theme));
+        RefreshCurrent();
+    }
+
+    private async Task ShowAboutAsync()
+    {
+        var ver = typeof(App).Assembly.GetName().Version;
+        var panel = new StackPanel { Spacing = 8, MinWidth = 320 };
+        panel.Children.Add(new TextBlock { Text = "FluentZip", FontSize = 22, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = $"Version {ver?.ToString(3)}", Opacity = 0.8 });
+        panel.Children.Add(new TextBlock { Text = "A Windows 11-style interface for 7-Zip.", TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(new TextBlock { Text = "Powered by the 7-Zip engine (7z.exe).", TextWrapping = TextWrapping.Wrap, Opacity = 0.8 });
+        panel.Children.Add(new HyperlinkButton { Content = "Based on 711-zip by metawka", NavigateUri = new Uri("https://github.com/metawka/711zip") });
+        panel.Children.Add(new TextBlock { Text = "© 2026 metawka · LGPL-2.1 license", Opacity = 0.7, FontSize = 12 });
+
+        var dlg = new ContentDialog { Title = "About", Content = panel, CloseButtonText = "Close", XamlRoot = RootGrid.XamlRoot };
+        await dlg.ShowAsync();
+    }
+
+    // ---------- Helpers ----------
+
+    private static bool IsArchive(string name) => ArchiveExts.Contains(Path.GetExtension(name));
+
+    private static void LaunchPath(string path)
+    {
+        try { Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true }); }
+        catch { }
+    }
+
+    private NavEntry CaptureCurrent()
+    {
+        var view = _view; var dir = _currentDir; var arc = _openArchive; var sub = _archiveSubPath;
+        Action restore = () =>
+        {
+            switch (view)
+            {
+                case View.Archive when arc is not null: _ = RestoreArchiveAsync(arc, sub); break;
+                case View.Folder when dir is not null: NavigateToFolder(dir, pushHistory: false); break;
+                case View.Favorites: ShowFavorites(pushHistory: false); break;
+                default: ShowDrives(pushHistory: false); break;
+            }
+        };
+        return new NavEntry(restore, ListScroll?.VerticalOffset ?? 0);
+    }
+
+    // A brand-new navigation invalidates the forward history.
+    private void PushCurrent()
+    {
+        _back.Push(CaptureCurrent());
+        _forward.Clear();
+    }
+
+    private void UpdateCommandState()
+    {
+        BackButton.IsEnabled = _back.Count > 0;
+        ForwardButton.IsEnabled = _forward.Count > 0;
+
+        bool canExtract = _view == View.Archive
+            || FileList.SelectedItems.OfType<FileItem>().Any(i => i.Kind == ItemKind.Archive);
+        ExtractButton.IsEnabled = canExtract && _engine.EngineAvailable;
+
+        bool canCompress = _view == View.Folder
+            && FileList.SelectedItems.OfType<FileItem>().Any(i => i.Kind != ItemKind.UpDir);
+        CompressButton.IsEnabled = canCompress && _engine.EngineAvailable;
+    }
+
+    private void SetBusy(bool busy) => Busy.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+    private void SetStatus(string text) => StatusText.Text = text;
+
+    // ---------- View modes, sorting, selection ----------
+
+    private ViewState _viewState = null!;
+    private FileItemTemplateSelector _templateSelector = null!;
+
+    // Reads the saved view/sort prefs, ticks the matching menu items, and applies the
+    // view mode. Called once from the constructor after the theme is set.
+    private void SetupItemViews()
+    {
+        _viewState = (ViewState)Application.Current.Resources["ViewState"];
+        _viewState.IconSize = _settings.IconSize;
+        _templateSelector = (FileItemTemplateSelector)RootGrid.Resources["ItemTemplates"];
+
+        SortNameItem.IsChecked = _settings.SortField == "Name";
+        SortModifiedItem.IsChecked = _settings.SortField == "Modified";
+        SortTypeItem.IsChecked = _settings.SortField == "Type";
+        SortSizeItem.IsChecked = _settings.SortField == "Size";
+        SortAscItem.IsChecked = !_settings.SortDescending;
+        SortDescItem.IsChecked = _settings.SortDescending;
+        GroupNoneItem.IsChecked = _settings.GroupBy == "None";
+        GroupTypeItem.IsChecked = _settings.GroupBy == "Type";
+        GroupModifiedItem.IsChecked = _settings.GroupBy == "Modified";
+        GroupSizeItem.IsChecked = _settings.GroupBy == "Size";
+        GroupNameItem.IsChecked = _settings.GroupBy == "Name";
+
+        ApplyViewMode(_settings.ViewMode, rebuild: false);
+    }
+
+    private void ApplyViewMode(string mode, bool rebuild)
+    {
+        _settings.ViewMode = mode;
+        _templateSelector.Mode = mode;
+
+        ViewLargeItem.IsChecked = mode == "LargeIcons";
+        ViewSmallItem.IsChecked = mode == "SmallIcons";
+        ViewListItem.IsChecked = mode == "List";
+        ViewDetailsItem.IsChecked = mode == "Details";
+
+        (string panel, string style) = mode switch
+        {
+            "LargeIcons" => ("WrapLargeTemplate", "TileItemStyle"),
+            "SmallIcons" => ("WrapSmallTemplate", "TileItemStyle"),
+            _ => ("StackPanelTemplate", "StackItemStyle"),
+        };
+        // Clear realized containers before swapping the panel: WinUI refuses to change
+        // ItemsPanel while items are still realized against the old one.
+        if (rebuild) Items.Clear();
+        FileList.ItemsPanel = (ItemsPanelTemplate)RootGrid.Resources[panel];
+        FileList.ItemContainerStyle = (Style)RootGrid.Resources[style];
+
+        if (rebuild) ReapplyOrdering();
+    }
+
+    // Rebuild the list so a template/panel switch re-realizes containers.
+    private void ReapplyOrdering()
+    {
+        if (_view is View.Folder or View.Archive) ApplyOrdering();
+        else RefreshCurrent();
+    }
+
+    private void OnViewModeClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string m)
+        {
+            ApplyViewMode(m, rebuild: true);
+            _settings.Save();
+        }
+    }
+
+    private void OnSortFieldClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string f)
+        {
+            _settings.SortField = f; _settings.Save();
+            ReapplyOrdering();
+        }
+    }
+
+    private void OnSortDirClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string d)
+        {
+            _settings.SortDescending = d == "Desc"; _settings.Save();
+            ReapplyOrdering();
+        }
+    }
+
+    private void OnGroupClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string g)
+        {
+            _settings.GroupBy = g; _settings.Save();
+            ReapplyOrdering();
+        }
+    }
+
+    // Ctrl+wheel cycles through the view modes (Explorer-style): wheel up moves toward
+    // large icons, wheel down toward the details table.
+    private static readonly string[] ViewCycle = { "Details", "List", "SmallIcons", "LargeIcons" };
+
+    private void OnListPointerWheel(object sender, PointerRoutedEventArgs e)
+    {
+        if ((e.KeyModifiers & VirtualKeyModifiers.Control) == 0) return;
+        int delta = e.GetCurrentPoint(FileList).Properties.MouseWheelDelta;
+        e.Handled = true;
+
+        int i = Array.IndexOf(ViewCycle, _settings.ViewMode);
+        if (i < 0) i = 0;
+        int next = Math.Clamp(i + (delta > 0 ? 1 : -1), 0, ViewCycle.Length - 1);
+        if (next == i) return;
+        ApplyViewMode(ViewCycle[next], rebuild: true);
+        _settings.Save();
+    }
+
+    // Keep group headers and the ".." row out of the selection no matter how they
+    // were picked up (Ctrl+A, marquee, etc.).
+    private void OnSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        foreach (var it in e.AddedItems.OfType<FileItem>()
+                     .Where(i => i.Kind is ItemKind.Header or ItemKind.UpDir).ToList())
+            FileList.SelectedItems.Remove(it);
+        UpdateCommandState();
+    }
+
+    // Single click on ".." navigates up (Explorer behaviour), no double-click needed.
+    private void OnListTapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (e.OriginalSource is DependencyObject d
+            && FindAncestor<ListViewItem>(d) is { } lvi
+            && FileList.ItemFromContainer(lvi) is FileItem { Kind: ItemKind.UpDir })
+            OnUp(this, null!);
+    }
+
+    // ---------- Rubber-band (marquee) selection ----------
+
+    private bool _marqueePending;   // non-handle press seen; becomes a marquee once the pointer moves
+    private bool _marqueeActive;
+    private bool _marqueeAdditive;
+    private Point _marqueeStart;
+    private List<FileItem> _marqueeBase = new();      // selection to keep (Ctrl/Shift additive)
+    private List<FileItem> _dragSnapshot = new();     // selection at press, for multi-item drag
+
+    // Pressed on the name text: once the pointer moves we capture it and start the drag
+    // programmatically. Starting it ourselves (instead of the framework's CanDrag gesture)
+    // removes the press-and-hold delay you get when a child drag element lives inside a
+    // ListViewItem that has already grabbed the pointer.
+    private bool _dragPending;
+    private FrameworkElement? _dragHandle;
+    private Point _dragStart;
+
+    // A press on the name text (the drag handle) is left to the ListView + drag system.
+    // A press anywhere else on a row, or on empty space, may start a marquee — but only
+    // after real movement, so a plain click still selects through the ListView.
+    private void OnListPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        _marqueePending = false;
+        _marqueeActive = false;
+        _dragPending = false;
+        _dragHandle = null;
+        if (!e.GetCurrentPoint(FileList).Properties.IsLeftButtonPressed) return;
+
+        _dragSnapshot = FileList.SelectedItems.OfType<FileItem>().ToList();
+
+        if (e.OriginalSource is DependencyObject d)
+        {
+            // Pressed on an item (the whole row/tile is the drag handle): let the
+            // ListView select on this press, and arm a drag that fires on the first
+            // move (see OnListPointerMoved).
+            if (FindDragHandle(d) is FrameworkElement handle)
+            {
+                _dragPending = true;
+                _dragHandle = handle;
+                _dragStart = e.GetCurrentPoint(FileList).Position;
+                return;
+            }
+            // Leave the scrollbar alone so the list still scrolls.
+            if (FindAncestor<ScrollBar>(d) is not null) return;
+        }
+
+        // Pressed anywhere else on a row (or empty space): this is marquee territory,
+        // not a per-row click. Capture the pointer to the list so the pressed
+        // ListViewItem can't swallow the moves (which stops the marquee starting) and
+        // can't keep itself selected — only the name selects. See OnListPointerReleased.
+        _marqueePending = true;
+        _marqueeAdditive = (e.KeyModifiers & (VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift)) != 0;
+        _marqueeStart = e.GetCurrentPoint(MarqueeLayer).Position;
+        _marqueeBase = _marqueeAdditive ? _dragSnapshot : new List<FileItem>();
+        FileList.CapturePointer(e.Pointer);
+    }
+
+    private void OnListPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        // Name-handle drag: the moment the pointer leaves the press point, capture it to
+        // the handle and start the drag — no hold delay. Capturing first is what makes
+        // StartDragAsync actually initiate an OS drag from here.
+        if (_dragPending && _dragHandle is FrameworkElement dh)
+        {
+            var dp = e.GetCurrentPoint(FileList).Position;
+            if (Math.Abs(dp.X - _dragStart.X) < 4 && Math.Abs(dp.Y - _dragStart.Y) < 4) return;
+            _dragPending = false;
+            _dragHandle = null;
+
+            // Archive: drive a native "virtual file" OLE drag so extraction happens on
+            // drop, not up front (see StartArchiveDrag). Everything else uses WinUI's
+            // StartDragAsync with real StorageItems.
+            if (_view == View.Archive && _openArchive is not null && dh.DataContext is FileItem clicked)
+            {
+                FileList.ReleasePointerCapture(e.Pointer);
+                StartArchiveDrag(clicked);
+                return;
+            }
+
+            try
+            {
+                dh.CapturePointer(e.Pointer);
+                _ = dh.StartDragAsync(e.GetCurrentPoint(dh));
+            }
+            catch (Exception ex) { DragLog("StartDragAsync failed: " + ex.Message); }
+            return;
+        }
+
+        if (!_marqueePending && !_marqueeActive) return;
+        var p = e.GetCurrentPoint(MarqueeLayer).Position;
+
+        if (!_marqueeActive)
+        {
+            if (Math.Abs(p.X - _marqueeStart.X) < 6 && Math.Abs(p.Y - _marqueeStart.Y) < 6) return;
+            _marqueeActive = true;
+            if (!_marqueeAdditive) FileList.SelectedItems.Clear();
+            MarqueeRect.Visibility = Visibility.Visible;
+            FileList.CapturePointer(e.Pointer);
+        }
+
+        double x = Math.Min(p.X, _marqueeStart.X), y = Math.Min(p.Y, _marqueeStart.Y);
+        double w = Math.Abs(p.X - _marqueeStart.X), h = Math.Abs(p.Y - _marqueeStart.Y);
+        Canvas.SetLeft(MarqueeRect, x); Canvas.SetTop(MarqueeRect, y);
+        MarqueeRect.Width = w; MarqueeRect.Height = h;
+
+        var box = new Rect(x, y, w, h);
+        var hits = new HashSet<FileItem>(_marqueeBase);
+        foreach (var item in Items)
+        {
+            if (item.Kind is ItemKind.UpDir or ItemKind.Header) continue;
+            if (FileList.ContainerFromItem(item) is not ListViewItem lvi) continue;
+            var b = lvi.TransformToVisual(MarqueeLayer).TransformBounds(new Rect(0, 0, lvi.ActualWidth, lvi.ActualHeight));
+            if (Intersects(box, b)) hits.Add(item);
+        }
+
+        var current = FileList.SelectedItems.OfType<FileItem>().ToHashSet();
+        foreach (var it in current.Where(c => !hits.Contains(c)).ToList()) FileList.SelectedItems.Remove(it);
+        foreach (var it in hits.Where(hh => !current.Contains(hh))) FileList.SelectedItems.Add(it);
+    }
+
+    private void OnListPointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        _dragPending = false;   // released without moving = a plain name click, no drag
+        _dragHandle = null;
+
+        bool wasPending = _marqueePending;
+        bool plainNonNameClick = _marqueePending && !_marqueeActive;
+        _marqueePending = false;
+
+        if (_marqueeActive)
+        {
+            _marqueeActive = false;
+            MarqueeRect.Visibility = Visibility.Collapsed;
+        }
+        // A plain click off the name is like clicking empty space: the ListView may have
+        // selected the row under the cursor, so undo that — only the name selects.
+        else if (plainNonNameClick && !_marqueeAdditive)
+        {
+            FileList.SelectedItems.Clear();
+        }
+
+        // Release the capture taken in OnListPointerPressed (also fires on capture-lost).
+        if (wasPending) FileList.ReleasePointerCapture(e.Pointer);
+    }
+
+    private static bool Intersects(Rect a, Rect b) =>
+        a.Left <= b.Right && a.Right >= b.Left && a.Top <= b.Bottom && a.Bottom >= b.Top;
+
+    // Walk up from the pressed element to the item-root element tagged as the drag handle.
+    private static FrameworkElement? FindDragHandle(DependencyObject? node)
+    {
+        while (node is not null)
+        {
+            if (node is FrameworkElement fe && fe.Tag as string == "draghandle") return fe;
+            node = VisualTreeHelper.GetParent(node);
+        }
+        return null;
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? node) where T : class
+    {
+        while (node is not null)
+        {
+            if (node is T t) return t;
+            node = VisualTreeHelper.GetParent(node);
+        }
+        return null;
+    }
+
+    // ---------- Modal progress overlay ----------
+
+    private System.Threading.CancellationTokenSource? _progressCts;
+
+    // Shows the overlay and returns the reporter + token to hand to the engine.
+    // Progress<int> posts back to the UI thread it is created on (here). 7z reports
+    // only an overall percentage, so the processed weight and the elapsed / remaining
+    // time are derived here from that percentage, a Stopwatch, and the known total size
+    // (0 = unknown, in which case only the percentage line is shown).
+    private (IProgress<int> progress, System.Threading.CancellationToken token) BeginProgress(string title, long totalBytes = 0)
+    {
+        _progressCts = new System.Threading.CancellationTokenSource();
+        ProgressTitle.Text = title;
+        ProgressBarCtl.Value = 0;
+        ProgressBarCtl.IsIndeterminate = true; // spin until the first % lands
+        ProgressPercent.Text = "";
+        ProgressSize.Text = "";
+        ProgressTime.Text = "";
+        ProgressCancel.IsEnabled = true;
+        ProgressOverlay.Visibility = Visibility.Visible;
+
+        var sw = Stopwatch.StartNew();
+        var progress = new Progress<int>(pct =>
+        {
+            ProgressBarCtl.IsIndeterminate = false;
+            ProgressBarCtl.Value = pct;
+            ProgressPercent.Text = $"{pct}%";
+
+            if (totalBytes > 0)
+            {
+                long done = (long)(totalBytes * (pct / 100.0));
+                ProgressSize.Text = $"{FileItem.FormatSize(done)} of {FileItem.FormatSize(totalBytes)}";
+            }
+
+            var elapsed = sw.Elapsed;
+            if (pct is > 0 and < 100)
+            {
+                var remaining = TimeSpan.FromSeconds(elapsed.TotalSeconds / pct * (100 - pct));
+                ProgressTime.Text = $"Elapsed {FormatDuration(elapsed)} · ~{FormatDuration(remaining)} remaining";
+            }
+            else
+            {
+                ProgressTime.Text = $"Elapsed {FormatDuration(elapsed)}";
+            }
+        });
+        return (progress, _progressCts.Token);
+    }
+
+    private static string FormatDuration(TimeSpan t)
+    {
+        if (t.TotalHours >= 1) return $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}";
+        return $"{t.Minutes}:{t.Seconds:00}";
+    }
+
+    // Total uncompressed weight of on-disk paths (files summed directly, folders walked).
+    private static long TotalPathsSize(IEnumerable<string> paths)
+    {
+        long total = 0;
+        foreach (var p in paths)
+        {
+            try
+            {
+                if (File.Exists(p)) total += new FileInfo(p).Length;
+                else if (Directory.Exists(p)) total += DirectorySize(p, System.Threading.CancellationToken.None);
+            }
+            catch { }
+        }
+        return total;
+    }
+
+    private void EndProgress()
+    {
+        ProgressOverlay.Visibility = Visibility.Collapsed;
+        _progressCts?.Dispose();
+        _progressCts = null;
+    }
+
+    private void OnProgressCancel(object sender, RoutedEventArgs e)
+    {
+        _progressCts?.Cancel();
+        ProgressCancel.IsEnabled = false;
+        ProgressPercent.Text = "Cancelling…";
+    }
+
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _statusTimer;
+
+    // Show a short-lived message (e.g. "Added to Favorites") that reverts to the
+    // normal item count instead of sticking around forever.
+    private void SetTransientStatus(string text)
+    {
+        SetStatus(text);
+        if (_statusTimer is null)
+        {
+            _statusTimer = DispatcherQueue.CreateTimer();
+            _statusTimer.IsRepeating = false;
+            _statusTimer.Interval = TimeSpan.FromSeconds(2.5);
+            _statusTimer.Tick += (t, _) => { t.Stop(); RefreshStatusText(); };
+        }
+        _statusTimer.Stop();
+        _statusTimer.Start();
+    }
+
+    private void RefreshStatusText() => SetStatus(_view switch
+    {
+        View.Drives => $"Drives: {Items.Count(i => i.Kind == ItemKind.Drive)}",
+        View.Favorites => $"Favorites: {_settings.Favorites.Count}",
+        _ => $"Items: {_rawItems.Count}",
+    });
+
+    private Task ShowInfo(string title, string message) => ShowDialog(title, message);
+    private Task ShowError(string title, string message) => ShowDialog(title, message);
+
+    private async Task<bool> Confirm(string title, string message)
+    {
+        var dlg = new ContentDialog
+        {
+            Title = title, Content = message,
+            PrimaryButtonText = "Yes", CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close, XamlRoot = RootGrid.XamlRoot,
+        };
+        return await dlg.ShowAsync() == ContentDialogResult.Primary;
+    }
+
+    private async Task ShowDialog(string title, string message)
+    {
+        var dlg = new ContentDialog
+        {
+            Title = title,
+            Content = new ScrollViewer { Content = new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true } },
+            CloseButtonText = "OK", XamlRoot = RootGrid.XamlRoot,
+        };
+        await dlg.ShowAsync();
+    }
+}
